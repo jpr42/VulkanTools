@@ -97,6 +97,11 @@ if(BUILD_MONITOR)
         monitor.cpp
         monitor_overlay.cpp
         monitor_overlay.h
+        monitor_overlay_shaders.h
+        monitor_renderer.cpp
+        monitor_renderer.h
+        shaders/monitor_overlay.vert
+        shaders/monitor_overlay.frag
         vk_layer_table.cpp
         vk_layer_table.h
         monitor_layer.md

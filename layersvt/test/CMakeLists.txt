@@ -74,7 +74,20 @@ if (TARGET VkLayer_monitor)
     add_test(NAME test_monitor_overlay COMMAND test_monitor_overlay)
     set_target_properties(test_monitor_overlay PROPERTIES FOLDER "layers/monitor/Test")
 
+    # Draws the overlay with a real Vulkan driver, and skips without one
+    add_executable(test_monitor_renderer
+                   test_monitor_renderer.cpp
+                   ../monitor_renderer.cpp
+                   ../monitor_renderer.h
+                   ../monitor_overlay.cpp
+                   ../monitor_overlay.h
+                   layer_test_main.cpp)
+    target_include_directories(test_monitor_renderer PRIVATE ..)
+    target_link_libraries(test_monitor_renderer Vulkan::Headers Vulkan::UtilityHeaders Vulkan::Loader GTest::gtest)
+    add_test(NAME test_monitor_renderer COMMAND test_monitor_renderer)
+    set_target_properties(test_monitor_renderer PROPERTIES FOLDER "layers/monitor/Test")
+
     if(WIN32 AND (QT_TARGET_TYPE STREQUAL STATIC_LIBRARY))
-      set_property(TARGET test_monitor_overlay PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+      set_property(TARGET test_monitor_overlay test_monitor_renderer PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
     endif()
 endif()
