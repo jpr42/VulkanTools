@@ -26,10 +26,22 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <memory>
 #include <mutex>
+#include <set>
+#include <string>
 #include <unordered_map>
+#include <utility>
+#include <vector>
 
 #include <vulkan/vulkan.h>
+
+#include "monitor_overlay.h"
+#include "monitor_present.h"
+
+#ifdef __ANDROID__
+#include <android/log.h>
+#endif
 
 #if defined(__linux__)
 #include <dlfcn.h>
@@ -68,6 +80,13 @@ struct monitor_layer_data {
     time_t lastTime{};
     float fps{};
     int frame{};
+
+    // Device state for the overlay, guarded by `lock`
+    std::mutex lock;
+    struct monitor_layer_data *instance_data{};
+    std::vector<VkQueueFamilyProperties> queue_families;
+    std::unordered_map<VkQueue, uint32_t> queue_family_index;
+    std::unordered_map<VkSwapchainKHR, std::unique_ptr<monitor::SwapchainOverlay>> swapchains;
 };
 
 #if defined(VK_USE_PLATFORM_XCB_KHR)
@@ -92,6 +111,21 @@ template monitor_layer_data *GetLayerDataPtr<monitor_layer_data>(void *data_key,
 static monitor_layer_data *GetLayerData(void *key) {
     const std::scoped_lock lock(layer_data_lock);
     return GetLayerDataPtr(key, layer_data_map);
+}
+
+// Each distinct message is only shown once
+static void WarnOnce(const std::string &message) {
+    static std::mutex lock;
+    static std::set<std::string> shown;
+    const std::scoped_lock guard(lock);
+    if (!shown.insert(message).second) {
+        return;
+    }
+#ifdef __ANDROID__
+    __android_log_print(ANDROID_LOG_WARN, "VK_LAYER_LUNARG_monitor", "%s", message.c_str());
+#else
+    (void)fprintf(stderr, "VK_LAYER_LUNARG_monitor: %s\n", message.c_str());
+#endif
 }
 
 static void FreeLayerData(void *key) {
@@ -141,6 +175,13 @@ VKAPI_ATTR VkResult VKAPI_CALL vkCreateDevice(VkPhysicalDevice gpu, const VkDevi
 
     my_device_data->gpu = gpu;
     my_device_data->device = *pDevice;
+    my_device_data->instance_data = instance_data;
+
+    uint32_t family_count = 0;
+    instance_data->instance_dispatch_table->GetPhysicalDeviceQueueFamilyProperties(gpu, &family_count, nullptr);
+    my_device_data->queue_families.resize(family_count);
+    instance_data->instance_dispatch_table->GetPhysicalDeviceQueueFamilyProperties(gpu, &family_count,
+                                                                                   my_device_data->queue_families.data());
     my_device_data->frame = 0;
     my_device_data->lastFrame = 0;
     my_device_data->fps = 0.0;
@@ -158,6 +199,13 @@ VKAPI_ATTR void VKAPI_CALL vkDestroyDevice(VkDevice device, const VkAllocationCa
     monitor_layer_data *my_data = GetLayerData(key);
     VkuDeviceDispatchTable *pTable = my_data->device_dispatch_table;
     pTable->DeviceWaitIdle(device);
+    {
+        const std::scoped_lock lock(my_data->lock);
+        for (auto &swapchain : my_data->swapchains) {
+            monitor::DestroySwapchainOverlay(device, *pTable, *swapchain.second);
+        }
+        my_data->swapchains.clear();
+    }
     pTable->DestroyDevice(device, pAllocator);
     delete pTable;
     FreeLayerData(key);
@@ -354,6 +402,74 @@ VKAPI_ATTR VkResult VKAPI_CALL vkCreateXcbSurfaceKHR(VkInstance instance, const 
 }
 #endif
 
+VKAPI_ATTR void VKAPI_CALL vkGetDeviceQueue(VkDevice device, uint32_t queueFamilyIndex, uint32_t queueIndex, VkQueue *pQueue) {
+    monitor_layer_data *my_data = GetLayerData(get_dispatch_key(device));
+    my_data->device_dispatch_table->GetDeviceQueue(device, queueFamilyIndex, queueIndex, pQueue);
+
+    const std::scoped_lock lock(my_data->lock);
+    my_data->queue_family_index[*pQueue] = queueFamilyIndex;
+}
+
+VKAPI_ATTR void VKAPI_CALL vkGetDeviceQueue2(VkDevice device, const VkDeviceQueueInfo2 *pQueueInfo, VkQueue *pQueue) {
+    monitor_layer_data *my_data = GetLayerData(get_dispatch_key(device));
+    my_data->device_dispatch_table->GetDeviceQueue2(device, pQueueInfo, pQueue);
+
+    const std::scoped_lock lock(my_data->lock);
+    my_data->queue_family_index[*pQueue] = pQueueInfo->queueFamilyIndex;
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL vkCreateSwapchainKHR(VkDevice device, const VkSwapchainCreateInfoKHR *pCreateInfo,
+                                                    const VkAllocationCallbacks *pAllocator, VkSwapchainKHR *pSwapchain) {
+    monitor_layer_data *my_data = GetLayerData(get_dispatch_key(device));
+    const VkuDeviceDispatchTable &dispatch = *my_data->device_dispatch_table;
+
+    // The overlay renders into the swapchain images, so they need to be color attachments
+    const monitor::Eligibility eligibility = monitor::SwapchainOverlayEligibility(*pCreateInfo);
+    const VkSwapchainCreateInfoKHR create_info = eligibility.ok ? monitor::PatchSwapchainCreateInfo(*pCreateInfo) : *pCreateInfo;
+    const VkResult result = dispatch.CreateSwapchainKHR(device, &create_info, pAllocator, pSwapchain);
+    if (result != VK_SUCCESS) {
+        return result;
+    }
+
+    VkFormatProperties format_properties = {};
+    my_data->instance_data->instance_dispatch_table->GetPhysicalDeviceFormatProperties(my_data->gpu, create_info.imageFormat,
+                                                                                       &format_properties);
+    const bool blend = (format_properties.optimalTilingFeatures & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BLEND_BIT) != 0;
+
+    auto overlay = std::make_unique<monitor::SwapchainOverlay>();
+    monitor::SetupSwapchainOverlay(device, dispatch, *pSwapchain, create_info, blend, *overlay);
+    if (!overlay->ok) {
+        WarnOnce(std::string("no overlay on some swapchains, ") + overlay->reason);
+    }
+
+    const std::scoped_lock lock(my_data->lock);
+    my_data->swapchains[*pSwapchain] = std::move(overlay);
+    return result;
+}
+
+VKAPI_ATTR void VKAPI_CALL vkDestroySwapchainKHR(VkDevice device, VkSwapchainKHR swapchain,
+                                                 const VkAllocationCallbacks *pAllocator) {
+    monitor_layer_data *my_data = GetLayerData(get_dispatch_key(device));
+    const VkuDeviceDispatchTable &dispatch = *my_data->device_dispatch_table;
+    {
+        const std::scoped_lock lock(my_data->lock);
+        auto it = my_data->swapchains.find(swapchain);
+        if (it != my_data->swapchains.end()) {
+            monitor::DestroySwapchainOverlay(device, dispatch, *it->second);
+            my_data->swapchains.erase(it);
+        }
+    }
+    dispatch.DestroySwapchainKHR(device, swapchain, pAllocator);
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL vkCreateSharedSwapchainsKHR(VkDevice device, uint32_t swapchainCount,
+                                                           const VkSwapchainCreateInfoKHR *pCreateInfos,
+                                                           const VkAllocationCallbacks *pAllocator, VkSwapchainKHR *pSwapchains) {
+    WarnOnce("no overlay on swapchains from vkCreateSharedSwapchainsKHR");
+    const monitor_layer_data *my_data = GetLayerData(get_dispatch_key(device));
+    return my_data->device_dispatch_table->CreateSharedSwapchainsKHR(device, swapchainCount, pCreateInfos, pAllocator, pSwapchains);
+}
+
 #if defined(__GNUC__) && __GNUC__ >= 4
 #define EXPORT_FUNCTION __attribute__((visibility("default")))
 #elif defined(__SUNPRO_C) && (__SUNPRO_C >= 0x590)
@@ -364,11 +480,12 @@ VKAPI_ATTR VkResult VKAPI_CALL vkCreateXcbSurfaceKHR(VkInstance instance, const 
 
 EXPORT_FUNCTION VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vkGetDeviceProcAddr(VkDevice dev, const char *funcName) {
 #define ADD_HOOK(fn) \
-    if (!strncmp(#fn, funcName, sizeof(#fn))) return (PFN_vkVoidFunction)fn
+    if (!strncmp(#fn, funcName, sizeof(#fn))) return reinterpret_cast<PFN_vkVoidFunction>(fn)
 
     ADD_HOOK(vkGetDeviceProcAddr);
     ADD_HOOK(vkDestroyDevice);
     ADD_HOOK(vkQueuePresentKHR);
+    ADD_HOOK(vkGetDeviceQueue);
 #undef ADD_HOOK
 
     if (dev == NULL) return NULL;
@@ -378,12 +495,24 @@ EXPORT_FUNCTION VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vkGetDeviceProcAddr(VkD
     VkuDeviceDispatchTable *pTable = dev_data->device_dispatch_table;
 
     if (pTable->GetDeviceProcAddr == NULL) return NULL;
-    return pTable->GetDeviceProcAddr(dev, funcName);
+    PFN_vkVoidFunction next = pTable->GetDeviceProcAddr(dev, funcName);
+
+    // Functions from extensions or newer versions are only hooked when the device has them
+#define ADD_HOOK_IF_SUPPORTED(fn) \
+    if (next && !strncmp(#fn, funcName, sizeof(#fn))) return reinterpret_cast<PFN_vkVoidFunction>(fn)
+
+    ADD_HOOK_IF_SUPPORTED(vkGetDeviceQueue2);
+    ADD_HOOK_IF_SUPPORTED(vkCreateSwapchainKHR);
+    ADD_HOOK_IF_SUPPORTED(vkDestroySwapchainKHR);
+    ADD_HOOK_IF_SUPPORTED(vkCreateSharedSwapchainsKHR);
+#undef ADD_HOOK_IF_SUPPORTED
+
+    return next;
 }
 
 EXPORT_FUNCTION VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vkGetInstanceProcAddr(VkInstance instance, const char *funcName) {
 #define ADD_HOOK(fn) \
-    if (!strncmp(#fn, funcName, sizeof(#fn))) return (PFN_vkVoidFunction)fn
+    if (!strncmp(#fn, funcName, sizeof(#fn))) return reinterpret_cast<PFN_vkVoidFunction>(fn)
 
     ADD_HOOK(vkCreateInstance);
     ADD_HOOK(vkCreateDevice);
