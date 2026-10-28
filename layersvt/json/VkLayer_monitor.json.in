@@ -9,7 +9,7 @@
         "description": "Execution Monitoring Layer",
         "introduction": "The monitor utility layer draws the frame rate, frame time and frame number on top of the images the application presents.",
         "url": "https://vulkan.lunarg.com/doc/sdk/latest/windows/monitor_layer.html",
-        "platforms": [ "WINDOWS", "LINUX" ],
+        "platforms": [ "WINDOWS", "LINUX", "MACOS", "ANDROID" ],
         "instance_extensions": [
             {
                 "name": "VK_EXT_layer_settings",

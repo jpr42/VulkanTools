@@ -468,3 +468,66 @@ TEST_F(MonitorSwapchainTests, PresentFromTwoDevicesAtOnce) {
     vkDestroySwapchainKHR(other_device, other_swapchain, nullptr);
     vkDestroyDevice(other_device, nullptr);
 }
+
+#ifdef _WIN32
+#include <windows.h>
+#else
+#include <dlfcn.h>
+#endif
+
+// The Android loader has no manifests: it finds layers through these functions exported by the library itself.
+TEST_F(MonitorTests, LayerLibraryDescribesItself) {
+    TEST_DESCRIPTION("The layer library exports the vkEnumerate*Properties functions loaders without manifests need");
+
+#ifdef _WIN32
+    HMODULE library = LoadLibraryA(LAYER_LIBRARY);
+    ASSERT_NE(library, nullptr);
+    auto lookup = [&](const char* name) { return reinterpret_cast<PFN_vkVoidFunction>(GetProcAddress(library, name)); };
+#else
+    void* library = dlopen(LAYER_LIBRARY, RTLD_NOW | RTLD_LOCAL);
+    ASSERT_NE(library, nullptr) << dlerror();
+    auto lookup = [&](const char* name) { return reinterpret_cast<PFN_vkVoidFunction>(dlsym(library, name)); };
+#endif
+
+    auto enumerate_instance_layers =
+        reinterpret_cast<PFN_vkEnumerateInstanceLayerProperties>(lookup("vkEnumerateInstanceLayerProperties"));
+    auto enumerate_device_layers =
+        reinterpret_cast<PFN_vkEnumerateDeviceLayerProperties>(lookup("vkEnumerateDeviceLayerProperties"));
+    auto enumerate_instance_extensions =
+        reinterpret_cast<PFN_vkEnumerateInstanceExtensionProperties>(lookup("vkEnumerateInstanceExtensionProperties"));
+    auto enumerate_device_extensions =
+        reinterpret_cast<PFN_vkEnumerateDeviceExtensionProperties>(lookup("vkEnumerateDeviceExtensionProperties"));
+    ASSERT_NE(enumerate_instance_layers, nullptr);
+    ASSERT_NE(enumerate_device_layers, nullptr);
+    ASSERT_NE(enumerate_instance_extensions, nullptr);
+    ASSERT_NE(enumerate_device_extensions, nullptr);
+
+    uint32_t count = 1;
+    VkLayerProperties properties = {};
+    ASSERT_EQ(enumerate_instance_layers(&count, &properties), VK_SUCCESS);
+    ASSERT_EQ(count, 1u);
+    EXPECT_STREQ(properties.layerName, kLayerName);
+    EXPECT_EQ(properties.implementationVersion, 2u);
+
+    properties = {};
+    ASSERT_EQ(enumerate_device_layers(VK_NULL_HANDLE, &count, &properties), VK_SUCCESS);
+    ASSERT_EQ(count, 1u);
+    EXPECT_STREQ(properties.layerName, kLayerName);
+
+    count = 0;
+    ASSERT_EQ(enumerate_instance_extensions(kLayerName, &count, nullptr), VK_SUCCESS);
+    std::vector<VkExtensionProperties> extensions(count);
+    ASSERT_EQ(enumerate_instance_extensions(kLayerName, &count, extensions.data()), VK_SUCCESS);
+    bool layer_settings = false;
+    for (const VkExtensionProperties& extension : extensions) {
+        layer_settings |= strcmp(extension.extensionName, VK_EXT_LAYER_SETTINGS_EXTENSION_NAME) == 0;
+    }
+    EXPECT_TRUE(layer_settings);
+    EXPECT_EQ(enumerate_instance_extensions("VK_LAYER_some_other", &count, nullptr), VK_ERROR_LAYER_NOT_PRESENT);
+
+#ifdef _WIN32
+    FreeLibrary(library);
+#else
+    dlclose(library);
+#endif
+}

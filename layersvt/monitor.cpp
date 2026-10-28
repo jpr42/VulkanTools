@@ -454,6 +454,73 @@ VKAPI_ATTR VkResult VKAPI_CALL vkCreateSharedSwapchainsKHR(VkDevice device, uint
 #define EXPORT_FUNCTION
 #endif
 
+// Loaders without layer manifests, such as Android's, find the layer through these
+static const VkLayerProperties monitor_layer_properties = {
+    "VK_LAYER_LUNARG_monitor",
+    VK_HEADER_VERSION_COMPLETE,
+    2,
+    "Execution Monitoring Layer",
+};
+
+static const VkExtensionProperties monitor_instance_extensions[] = {
+    {VK_EXT_LAYER_SETTINGS_EXTENSION_NAME, VK_EXT_LAYER_SETTINGS_SPEC_VERSION},
+};
+
+// The hooks have their own names. On Linux, taking the address of an exported vkEnumerate* function from inside the layer
+// can resolve to the loader's function of the same name.
+static VKAPI_ATTR VkResult VKAPI_CALL EnumerateInstanceLayerProperties(uint32_t *pCount, VkLayerProperties *pProperties) {
+    return util_GetLayerProperties(1, &monitor_layer_properties, pCount, pProperties);
+}
+
+static VKAPI_ATTR VkResult VKAPI_CALL EnumerateDeviceLayerProperties(VkPhysicalDevice /*physicalDevice*/, uint32_t *pCount,
+                                                                     VkLayerProperties *pProperties) {
+    return util_GetLayerProperties(1, &monitor_layer_properties, pCount, pProperties);
+}
+
+static VKAPI_ATTR VkResult VKAPI_CALL EnumerateInstanceExtensionProperties(const char *pLayerName, uint32_t *pCount,
+                                                                           VkExtensionProperties *pProperties) {
+    if (pLayerName && (strcmp(pLayerName, monitor_layer_properties.layerName) == 0)) {
+        return util_GetExtensionProperties(1, monitor_instance_extensions, pCount, pProperties);
+    }
+    return VK_ERROR_LAYER_NOT_PRESENT;
+}
+
+static VKAPI_ATTR VkResult VKAPI_CALL EnumerateDeviceExtensionProperties(VkPhysicalDevice physicalDevice, const char *pLayerName,
+                                                                         uint32_t *pCount, VkExtensionProperties *pProperties) {
+    if (pLayerName && (strcmp(pLayerName, monitor_layer_properties.layerName) == 0)) {
+        return util_GetExtensionProperties(0, nullptr, pCount, pProperties);
+    }
+    if (!physicalDevice) {
+        return VK_ERROR_LAYER_NOT_PRESENT;
+    }
+    const monitor_layer_data *my_data = GetLayerData(get_dispatch_key(physicalDevice));
+    if (!my_data->instance_dispatch_table) {
+        return VK_ERROR_LAYER_NOT_PRESENT;
+    }
+    return my_data->instance_dispatch_table->EnumerateDeviceExtensionProperties(physicalDevice, pLayerName, pCount, pProperties);
+}
+
+EXPORT_FUNCTION VKAPI_ATTR VkResult VKAPI_CALL vkEnumerateInstanceLayerProperties(uint32_t *pCount,
+                                                                                  VkLayerProperties *pProperties) {
+    return EnumerateInstanceLayerProperties(pCount, pProperties);
+}
+
+EXPORT_FUNCTION VKAPI_ATTR VkResult VKAPI_CALL vkEnumerateDeviceLayerProperties(VkPhysicalDevice physicalDevice, uint32_t *pCount,
+                                                                                VkLayerProperties *pProperties) {
+    return EnumerateDeviceLayerProperties(physicalDevice, pCount, pProperties);
+}
+
+EXPORT_FUNCTION VKAPI_ATTR VkResult VKAPI_CALL vkEnumerateInstanceExtensionProperties(const char *pLayerName, uint32_t *pCount,
+                                                                                      VkExtensionProperties *pProperties) {
+    return EnumerateInstanceExtensionProperties(pLayerName, pCount, pProperties);
+}
+
+EXPORT_FUNCTION VKAPI_ATTR VkResult VKAPI_CALL vkEnumerateDeviceExtensionProperties(VkPhysicalDevice physicalDevice,
+                                                                                    const char *pLayerName, uint32_t *pCount,
+                                                                                    VkExtensionProperties *pProperties) {
+    return EnumerateDeviceExtensionProperties(physicalDevice, pLayerName, pCount, pProperties);
+}
+
 EXPORT_FUNCTION VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vkGetDeviceProcAddr(VkDevice dev, const char *funcName) {
 #define ADD_HOOK(fn) \
     if (!strncmp(#fn, funcName, sizeof(#fn))) return reinterpret_cast<PFN_vkVoidFunction>(fn)
@@ -495,6 +562,18 @@ EXPORT_FUNCTION VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vkGetInstanceProcAddr(V
     ADD_HOOK(vkDestroyInstance);
     ADD_HOOK(vkGetInstanceProcAddr);
     ADD_HOOK(vkGetPhysicalDeviceToolPropertiesEXT);
+    if (strcmp(funcName, "vkEnumerateInstanceLayerProperties") == 0) {
+        return reinterpret_cast<PFN_vkVoidFunction>(EnumerateInstanceLayerProperties);
+    }
+    if (strcmp(funcName, "vkEnumerateDeviceLayerProperties") == 0) {
+        return reinterpret_cast<PFN_vkVoidFunction>(EnumerateDeviceLayerProperties);
+    }
+    if (strcmp(funcName, "vkEnumerateInstanceExtensionProperties") == 0) {
+        return reinterpret_cast<PFN_vkVoidFunction>(EnumerateInstanceExtensionProperties);
+    }
+    if (strcmp(funcName, "vkEnumerateDeviceExtensionProperties") == 0) {
+        return reinterpret_cast<PFN_vkVoidFunction>(EnumerateDeviceExtensionProperties);
+    }
 #undef ADD_HOOK
 
     if (instance == NULL) return NULL;

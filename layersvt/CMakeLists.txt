@@ -91,7 +91,11 @@ if(BUILD_APIDUMP)
 endif ()
 
 if(BUILD_MONITOR)
-    add_library(VkLayer_monitor MODULE)
+    if(IOS)
+        add_library(VkLayer_monitor SHARED)
+    else()
+        add_library(VkLayer_monitor MODULE)
+    endif()
     set_target_properties(VkLayer_monitor PROPERTIES FOLDER "layers/monitor")
     target_sources(VkLayer_monitor PRIVATE
         monitor.cpp
