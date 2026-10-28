@@ -16,7 +16,12 @@
 
 #include <gtest/gtest.h>
 
+#include <atomic>
+#include <cctype>
+#include <chrono>
+#include <cstddef>
 #include <cstdint>
+#include <fstream>
 #include <iterator>
 #include <set>
 #include <string>
@@ -559,6 +564,66 @@ TEST(MonitorOverlay, SettingsHideLines) {
     EXPECT_FALSE(settings.lines.fps);
     EXPECT_TRUE(settings.lines.frame_time);
     EXPECT_FALSE(settings.lines.frame_number);
+}
+
+// The fragment shader has its own copy of the font, as "const uint kFont[...] = uint[](...)" with one row per value.
+TEST(MonitorOverlay, ShaderFontMatchesFont) {
+    std::ifstream file(MONITOR_SHADER_DIR "/monitor_overlay.frag");
+    ASSERT_TRUE(file.is_open());
+    const std::string source((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+
+    const size_t begin = source.find("uint[](");
+    ASSERT_NE(begin, std::string::npos);
+    const size_t end = source.find(");", begin);
+    ASSERT_NE(end, std::string::npos);
+
+    std::vector<uint32_t> rows;
+    const std::string values = source.substr(begin + 7, end - begin - 7);
+    for (size_t i = 0; i < values.size();) {
+        if (std::isdigit(static_cast<unsigned char>(values[i])) != 0) {
+            size_t length = 0;
+            rows.push_back(static_cast<uint32_t>(std::stoul(values.substr(i), &length, 0)));
+            i += length;
+        } else if (values.compare(i, 2, "//") == 0) {
+            i = values.find('\n', i);
+        } else {
+            ++i;
+        }
+    }
+
+    ASSERT_EQ(rows.size(), static_cast<size_t>(monitor::kGlyphCount * monitor::kGlyphHeight));
+    for (int glyph = 0; glyph < monitor::kGlyphCount; ++glyph) {
+        for (int row = 0; row < monitor::kGlyphHeight; ++row) {
+            EXPECT_EQ(rows[static_cast<size_t>((glyph * monitor::kGlyphHeight) + row)],
+                      monitor::GlyphRow(static_cast<uint8_t>(glyph), row))
+                << "glyph " << glyph << " row " << row;
+        }
+    }
+}
+
+// The fragment shader repeats the panel metrics as "const int kName = value;".
+TEST(MonitorOverlay, ShaderMetricsMatchLayout) {
+    std::ifstream file(MONITOR_SHADER_DIR "/monitor_overlay.frag");
+    ASSERT_TRUE(file.is_open());
+    const std::string source((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+
+    const auto shader_constant = [&](const std::string& name) -> int {
+        const std::string declaration = "const int " + name + " = ";
+        const size_t pos = source.find(declaration);
+        if (pos == std::string::npos) {
+            ADD_FAILURE() << name << " not found in the shader";
+            return -1;
+        }
+        return std::stoi(source.substr(pos + declaration.size()));
+    };
+
+    EXPECT_EQ(shader_constant("kGlyphWidth"), monitor::kGlyphWidth);
+    EXPECT_EQ(shader_constant("kGlyphHeight"), monitor::kGlyphHeight);
+    EXPECT_EQ(shader_constant("kGlyphCount"), monitor::kGlyphCount);
+    EXPECT_EQ(shader_constant("kCharAdvance"), monitor::kCharAdvance);
+    EXPECT_EQ(shader_constant("kLineAdvance"), monitor::kLineAdvance);
+    EXPECT_EQ(shader_constant("kPadding"), monitor::kPadding);
+    EXPECT_EQ(shader_constant("kMaxColumns"), static_cast<int>(monitor::kMaxColumns));
 }
 
 TEST(MonitorOverlay, TextUsesOnlyDrawableCharacters) {
