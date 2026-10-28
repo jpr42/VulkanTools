@@ -26,6 +26,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <mutex>
 #include <unordered_map>
 
 #include <vulkan/vulkan.h>
@@ -58,6 +59,7 @@ struct monitor_layer_data {
 #endif
     char base_title[TITLE_LENGTH]{};
     bool got_title = false;
+    VkInstance instance{};
     VkPhysicalDevice gpu{};
     VkDevice device{};
 
@@ -80,11 +82,26 @@ static struct {
 } xcb = {NULL};
 #endif
 
-static std::unordered_map<VkPhysicalDevice, VkInstance> layer_instances;
+// Instances and devices are created and destroyed from any thread, so the map is always locked.
+static std::mutex layer_data_lock;
 static std::unordered_map<void *, monitor_layer_data *> layer_data_map;
 
 template monitor_layer_data *GetLayerDataPtr<monitor_layer_data>(void *data_key,
                                                                  std::unordered_map<void *, monitor_layer_data *> &data_map);
+
+static monitor_layer_data *GetLayerData(void *key) {
+    const std::scoped_lock lock(layer_data_lock);
+    return GetLayerDataPtr(key, layer_data_map);
+}
+
+static void FreeLayerData(void *key) {
+    const std::scoped_lock lock(layer_data_lock);
+    auto it = layer_data_map.find(key);
+    if (it != layer_data_map.end()) {
+        delete it->second;
+        layer_data_map.erase(it);
+    }
+}
 
 VKAPI_ATTR VkResult VKAPI_CALL vkCreateDevice(VkPhysicalDevice gpu, const VkDeviceCreateInfo *pCreateInfo,
                                               const VkAllocationCallbacks *pAllocator, VkDevice *pDevice) {
@@ -93,7 +110,9 @@ VKAPI_ATTR VkResult VKAPI_CALL vkCreateDevice(VkPhysicalDevice gpu, const VkDevi
     assert(chain_info->u.pLayerInfo);
     PFN_vkGetInstanceProcAddr fpGetInstanceProcAddr = chain_info->u.pLayerInfo->pfnNextGetInstanceProcAddr;
     PFN_vkGetDeviceProcAddr fpGetDeviceProcAddr = chain_info->u.pLayerInfo->pfnNextGetDeviceProcAddr;
-    PFN_vkCreateDevice fpCreateDevice = (PFN_vkCreateDevice)fpGetInstanceProcAddr(layer_instances.at(gpu), "vkCreateDevice");
+    // Physical devices share their instance's dispatch key
+    monitor_layer_data *instance_data = GetLayerData(get_dispatch_key(gpu));
+    auto fpCreateDevice = reinterpret_cast<PFN_vkCreateDevice>(fpGetInstanceProcAddr(instance_data->instance, "vkCreateDevice"));
     if (fpCreateDevice == NULL) {
         return VK_ERROR_INITIALIZATION_FAILED;
     }
@@ -106,7 +125,7 @@ VKAPI_ATTR VkResult VKAPI_CALL vkCreateDevice(VkPhysicalDevice gpu, const VkDevi
         return result;
     }
 
-    monitor_layer_data *my_device_data = GetLayerDataPtr(get_dispatch_key(*pDevice), layer_data_map);
+    monitor_layer_data *my_device_data = GetLayerData(get_dispatch_key(*pDevice));
 
     // Setup device dispatch table
     my_device_data->device_dispatch_table = new VkuDeviceDispatchTable;
@@ -134,54 +153,14 @@ VKAPI_ATTR VkResult VKAPI_CALL vkCreateDevice(VkPhysicalDevice gpu, const VkDevi
     return result;
 }
 
-VKAPI_ATTR VkResult VKAPI_CALL vkEnumeratePhysicalDevices(VkInstance instance, uint32_t *pPhysicalDeviceCount,
-                                                          VkPhysicalDevice *pPhysicalDevices) {
-    dispatch_key key = get_dispatch_key(instance);
-    monitor_layer_data *my_data = GetLayerDataPtr(key, layer_data_map);
-    VkuInstanceDispatchTable *pTable = my_data->instance_dispatch_table;
-
-    VkResult result = pTable->EnumeratePhysicalDevices(instance, pPhysicalDeviceCount, pPhysicalDevices);
-
-    if (pPhysicalDevices != nullptr) {
-        for (int i = 0; i < *pPhysicalDeviceCount; ++i) {
-            if (layer_instances.count(pPhysicalDevices[i]) == 0) {
-                layer_instances.insert({pPhysicalDevices[i], instance});
-            }
-        }
-    }
-
-    return result;
-}
-
-VKAPI_ATTR VkResult VKAPI_CALL vkEnumeratePhysicalDeviceGroups(VkInstance instance, uint32_t *pPhysicalDeviceGroupCount,
-                                                               VkPhysicalDeviceGroupProperties *pPhysicalDeviceGroupProperties) {
-    dispatch_key key = get_dispatch_key(instance);
-    monitor_layer_data *my_data = GetLayerDataPtr(key, layer_data_map);
-    VkuInstanceDispatchTable *pTable = my_data->instance_dispatch_table;
-
-    VkResult result = pTable->EnumeratePhysicalDeviceGroups(instance, pPhysicalDeviceGroupCount, pPhysicalDeviceGroupProperties);
-
-    if (pPhysicalDeviceGroupProperties != nullptr) {
-        for (int i = 0; i < *pPhysicalDeviceGroupCount; ++i) {
-            for (int j = 0; j < pPhysicalDeviceGroupProperties[i].physicalDeviceCount; ++j) {
-                if (layer_instances.count(pPhysicalDeviceGroupProperties[i].physicalDevices[j]) == 0) {
-                    layer_instances.insert({pPhysicalDeviceGroupProperties[i].physicalDevices[j], instance});
-                }
-            }
-        }
-    }
-
-    return result;
-}
-
 VKAPI_ATTR void VKAPI_CALL vkDestroyDevice(VkDevice device, const VkAllocationCallbacks *pAllocator) {
     dispatch_key key = get_dispatch_key(device);
-    monitor_layer_data *my_data = GetLayerDataPtr(key, layer_data_map);
+    monitor_layer_data *my_data = GetLayerData(key);
     VkuDeviceDispatchTable *pTable = my_data->device_dispatch_table;
     pTable->DeviceWaitIdle(device);
     pTable->DestroyDevice(device, pAllocator);
     delete pTable;
-    layer_data_map.erase(key);
+    FreeLayerData(key);
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL vkCreateInstance(const VkInstanceCreateInfo *pCreateInfo, const VkAllocationCallbacks *pAllocator,
@@ -213,7 +192,8 @@ VKAPI_ATTR VkResult VKAPI_CALL vkCreateInstance(const VkInstanceCreateInfo *pCre
     VkResult result = fpCreateInstance(pCreateInfo, pAllocator, pInstance);
     if (result != VK_SUCCESS) return result;
 
-    monitor_layer_data *my_data = GetLayerDataPtr(get_dispatch_key(*pInstance), layer_data_map);
+    monitor_layer_data *my_data = GetLayerData(get_dispatch_key(*pInstance));
+    my_data->instance = *pInstance;
     my_data->instance_dispatch_table = new VkuInstanceDispatchTable;
     vkuInitInstanceDispatchTable(*pInstance, my_data->instance_dispatch_table, fpGetInstanceProcAddr);
 
@@ -248,15 +228,15 @@ VKAPI_ATTR VkResult VKAPI_CALL vkCreateInstance(const VkInstanceCreateInfo *pCre
 
 VKAPI_ATTR void VKAPI_CALL vkDestroyInstance(VkInstance instance, const VkAllocationCallbacks *pAllocator) {
     dispatch_key key = get_dispatch_key(instance);
-    monitor_layer_data *my_data = GetLayerDataPtr(key, layer_data_map);
+    const monitor_layer_data *my_data = GetLayerData(key);
     VkuInstanceDispatchTable *pTable = my_data->instance_dispatch_table;
     pTable->DestroyInstance(instance, pAllocator);
     delete pTable;
-    layer_data_map.erase(key);
+    FreeLayerData(key);
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL vkQueuePresentKHR(VkQueue queue, const VkPresentInfoKHR *pPresentInfo) {
-    monitor_layer_data *my_data = GetLayerDataPtr(get_dispatch_key(queue), layer_data_map);
+    monitor_layer_data *my_data = GetLayerData(get_dispatch_key(queue));
 
     time_t now;
     time(&now);
@@ -265,7 +245,7 @@ VKAPI_ATTR VkResult VKAPI_CALL vkQueuePresentKHR(VkQueue queue, const VkPresentI
     if (seconds > 0.5) {
         char str[TITLE_LENGTH + FPS_LENGTH];
         char fpsstr[FPS_LENGTH];
-        monitor_layer_data *my_instance_data = GetLayerDataPtr(get_dispatch_key(my_data->gpu), layer_data_map);
+        monitor_layer_data *my_instance_data = GetLayerData(get_dispatch_key(my_data->gpu));
         my_data->fps = (my_data->frame - my_data->lastFrame) / seconds;
         my_data->lastFrame = my_data->frame;
         my_data->lastTime = now;
@@ -314,7 +294,7 @@ VKAPI_ATTR VkResult VKAPI_CALL vkGetPhysicalDeviceToolPropertiesEXT(VkPhysicalDe
         (*pToolCount)--;
     }
 
-    monitor_layer_data *my_data = GetLayerDataPtr(get_dispatch_key(physicalDevice), layer_data_map);
+    const monitor_layer_data *my_data = GetLayerData(get_dispatch_key(physicalDevice));
     VkResult result =
         my_data->instance_dispatch_table->GetPhysicalDeviceToolPropertiesEXT(physicalDevice, pToolCount, pToolProperties);
 
@@ -330,7 +310,7 @@ VKAPI_ATTR VkResult VKAPI_CALL vkGetPhysicalDeviceToolPropertiesEXT(VkPhysicalDe
 #if defined(VK_USE_PLATFORM_WIN32_KHR)
 VKAPI_ATTR VkResult VKAPI_CALL vkCreateWin32SurfaceKHR(VkInstance instance, const VkWin32SurfaceCreateInfoKHR *pCreateInfo,
                                                        const VkAllocationCallbacks *pAllocator, VkSurfaceKHR *pSurface) {
-    monitor_layer_data *my_data = GetLayerDataPtr(get_dispatch_key(instance), layer_data_map);
+    monitor_layer_data *my_data = GetLayerData(get_dispatch_key(instance));
     my_data->hwnd = pCreateInfo->hwnd;
 
     VkResult result = my_data->instance_dispatch_table->CreateWin32SurfaceKHR(instance, pCreateInfo, pAllocator, pSurface);
@@ -345,7 +325,7 @@ VKAPI_ATTR VkResult VKAPI_CALL vkCreateXcbSurfaceKHR(VkInstance instance, const 
     xcb_atom_t property = XCB_ATOM_WM_NAME;
     xcb_atom_t type = XCB_ATOM_STRING;
 
-    monitor_layer_data *my_data = GetLayerDataPtr(get_dispatch_key(instance), layer_data_map);
+    monitor_layer_data *my_data = GetLayerData(get_dispatch_key(instance));
 
     if (!xcb.xcbLib and !xcbErrorPrinted) {
         fprintf(stderr, "Monitor layer libxcb.so load failure, will not be able to display frame rate\n");
@@ -394,7 +374,7 @@ EXPORT_FUNCTION VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vkGetDeviceProcAddr(VkD
     if (dev == NULL) return NULL;
 
     monitor_layer_data *dev_data;
-    dev_data = GetLayerDataPtr(get_dispatch_key(dev), layer_data_map);
+    dev_data = GetLayerData(get_dispatch_key(dev));
     VkuDeviceDispatchTable *pTable = dev_data->device_dispatch_table;
 
     if (pTable->GetDeviceProcAddr == NULL) return NULL;
@@ -406,8 +386,6 @@ EXPORT_FUNCTION VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vkGetInstanceProcAddr(V
     if (!strncmp(#fn, funcName, sizeof(#fn))) return (PFN_vkVoidFunction)fn
 
     ADD_HOOK(vkCreateInstance);
-    ADD_HOOK(vkEnumeratePhysicalDevices);
-    ADD_HOOK(vkEnumeratePhysicalDeviceGroups);
     ADD_HOOK(vkCreateDevice);
     ADD_HOOK(vkDestroyInstance);
     ADD_HOOK(vkGetInstanceProcAddr);
@@ -422,7 +400,7 @@ EXPORT_FUNCTION VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vkGetInstanceProcAddr(V
     if (instance == NULL) return NULL;
 
     monitor_layer_data *instance_data;
-    instance_data = GetLayerDataPtr(get_dispatch_key(instance), layer_data_map);
+    instance_data = GetLayerData(get_dispatch_key(instance));
     VkuInstanceDispatchTable *pTable = instance_data->instance_dispatch_table;
 
     if (pTable->GetInstanceProcAddr == NULL) return NULL;

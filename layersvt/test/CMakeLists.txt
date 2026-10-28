@@ -47,9 +47,22 @@ function(LayerTest NAME)
     endif()
 endfunction()
 
+# The monitor layer tests run against the mock driver from Vulkan-Tools when update_deps.py built it,
+# so they don't need a GPU. Not on GitHub's Windows runners though: they run elevated, and the loader
+# ignores VK_LAYER_PATH and VK_DRIVER_FILES in elevated processes.
+if (TARGET VkLayer_monitor AND UPDATE_DEPS_DIR AND NOT (WIN32 AND RUN_ON_GITHUB))
+    find_file(MOCK_ICD_JSON VkICD_mock_icd.json
+              PATHS ${UPDATE_DEPS_DIR}/Vulkan-Tools/build/icd
+              PATH_SUFFIXES Debug Release RelWithDebInfo MinSizeRel
+              NO_DEFAULT_PATH NO_CACHE)
+endif()
+
 # These tests need a Vulkan driver, so they only run on LunarG's internal C.I.
 if (NOT RUN_ON_GITHUB)
-    set(LAYER_TEST_FILES api_dump monitor screenshot)
+    set(LAYER_TEST_FILES api_dump screenshot)
+    if (NOT MOCK_ICD_JSON)
+        list(APPEND LAYER_TEST_FILES monitor)
+    endif()
 
     foreach(test_item ${LAYER_TEST_FILES})
         # If the target doesn't exist continue.
@@ -59,6 +72,15 @@ if (NOT RUN_ON_GITHUB)
 
         LayerTest(${test_item})
     endforeach()
+endif()
+
+if (MOCK_ICD_JSON)
+    LayerTest(monitor)
+    # The mock ICD manifest has a relative library path, which the Windows loader can't join to a path with forward slashes
+    file(TO_NATIVE_PATH "${MOCK_ICD_JSON}" MOCK_ICD_JSON_NATIVE)
+    set_property(TEST test_monitor_layer APPEND PROPERTY ENVIRONMENT "VK_DRIVER_FILES=${MOCK_ICD_JSON_NATIVE}")
+elseif (TARGET VkLayer_monitor)
+    message(STATUS "Not using the mock ICD, test_monitor_layer needs a Vulkan driver")
 endif()
 
 # Monitor overlay logic doesn't need a Vulkan driver
