@@ -47,13 +47,33 @@ function(LayerTest NAME)
     endif()
 endfunction()
 
-set(LAYER_TEST_FILES api_dump monitor screenshot)
+# These tests need a Vulkan driver, so they only run on LunarG's internal C.I.
+if (NOT RUN_ON_GITHUB)
+    set(LAYER_TEST_FILES api_dump monitor screenshot)
 
-foreach(test_item ${LAYER_TEST_FILES})
-    # If the target doesn't exist continue.
-    if (NOT TARGET "VkLayer_${test_item}")
-        continue()
+    foreach(test_item ${LAYER_TEST_FILES})
+        # If the target doesn't exist continue.
+        if (NOT TARGET "VkLayer_${test_item}")
+            continue()
+        endif()
+
+        LayerTest(${test_item})
+    endforeach()
+endif()
+
+# Monitor overlay logic doesn't need a Vulkan driver
+if (TARGET VkLayer_monitor)
+    add_executable(test_monitor_overlay
+                   test_monitor_overlay.cpp
+                   ../monitor_overlay.cpp
+                   ../monitor_overlay.h
+                   layer_test_main.cpp)
+    target_include_directories(test_monitor_overlay PRIVATE ..)
+    target_link_libraries(test_monitor_overlay Vulkan::Headers GTest::gtest)
+    add_test(NAME test_monitor_overlay COMMAND test_monitor_overlay)
+    set_target_properties(test_monitor_overlay PROPERTIES FOLDER "layers/monitor/Test")
+
+    if(WIN32 AND (QT_TARGET_TYPE STREQUAL STATIC_LIBRARY))
+      set_property(TARGET test_monitor_overlay PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
     endif()
-
-    LayerTest(${test_item})
-endforeach()
+endif()

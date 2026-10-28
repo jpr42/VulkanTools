@@ -1,0 +1,572 @@
+/*
+ * Copyright (c) 2026 LunarG, Inc.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#include <gtest/gtest.h>
+
+#include <cstdint>
+#include <iterator>
+#include <set>
+#include <string>
+#include <thread>
+#include <utility>
+#include <vector>
+
+#include "monitor_overlay.h"
+
+using namespace std::chrono_literals;
+using Clock = std::chrono::steady_clock;
+
+// Feeds `count` presents spaced `delta` apart, starting at `start`. Returns the time of the last present.
+static Clock::time_point Present(monitor::FrameStats& stats, Clock::time_point start, Clock::duration delta, int count,
+                                 std::chrono::milliseconds interval = 500ms) {
+    Clock::time_point now = start;
+    for (int i = 0; i < count; ++i) {
+        monitor::RecordPresent(stats, now, interval);
+        now += delta;
+    }
+    return now - delta;
+}
+
+TEST(MonitorOverlay, StatsAt144HzAfterFirstInterval) {
+    monitor::FrameStats stats;
+    const auto delta = std::chrono::duration_cast<Clock::duration>(std::chrono::duration<double>(1.0 / 144.0));
+
+    Present(stats, Clock::time_point{}, delta, 10);
+    EXPECT_FALSE(stats.snapshot.valid);
+
+    Present(stats, Clock::time_point{} + 10 * delta, delta, 144);
+    ASSERT_TRUE(stats.snapshot.valid);
+    EXPECT_NEAR(stats.snapshot.fps, 144.0, 0.5);
+    EXPECT_NEAR(stats.snapshot.avg_ms, 1000.0 / 144.0, 0.01);
+}
+
+TEST(MonitorOverlay, StatsUseSubSecondIntervals) {
+    // A one-second clock would report 0 or a whole number of frames here.
+    monitor::FrameStats stats;
+    const auto delta = std::chrono::duration_cast<Clock::duration>(std::chrono::duration<double>(1.0 / 60.0));
+
+    Present(stats, Clock::time_point{}, delta, 17, 250ms);
+    ASSERT_TRUE(stats.snapshot.valid);
+    EXPECT_NEAR(stats.snapshot.fps, 60.0, 0.1);
+}
+
+TEST(MonitorOverlay, StatsReportHitchAsMaxFrameTime) {
+    monitor::FrameStats stats;
+    const auto delta = std::chrono::duration_cast<Clock::duration>(std::chrono::duration<double>(1.0 / 60.0));
+
+    Clock::time_point last = Present(stats, Clock::time_point{}, delta, 10, 2000ms);
+    last = Present(stats, last + 1000ms, delta, 120, 2000ms);
+
+    ASSERT_TRUE(stats.snapshot.valid);
+    EXPECT_NEAR(stats.snapshot.max_ms, 1000.0, 0.01);
+    EXPECT_NEAR(stats.snapshot.min_ms, 1000.0 / 60.0, 0.01);
+    EXPECT_GT(stats.snapshot.avg_ms, 1000.0 / 60.0);
+}
+
+TEST(MonitorOverlay, FrameNumbersStartAtZero) {
+    std::atomic<uint64_t> counter{0};
+    EXPECT_EQ(monitor::NextFrameNumber(counter), 0u);
+    EXPECT_EQ(monitor::NextFrameNumber(counter), 1u);
+    EXPECT_EQ(monitor::NextFrameNumber(counter), 2u);
+}
+
+TEST(MonitorOverlay, FrameNumbersAreUniqueAcrossThreads) {
+    std::atomic<uint64_t> counter{0};
+    constexpr int kPerThread = 10000;
+    std::vector<uint64_t> first_frames;
+    std::vector<uint64_t> second_frames;
+    first_frames.reserve(kPerThread);
+    second_frames.reserve(kPerThread);
+
+    std::thread first_thread([&] {
+        for (int i = 0; i < kPerThread; ++i) {
+            first_frames.push_back(monitor::NextFrameNumber(counter));
+        }
+    });
+    std::thread second_thread([&] {
+        for (int i = 0; i < kPerThread; ++i) {
+            second_frames.push_back(monitor::NextFrameNumber(counter));
+        }
+    });
+    first_thread.join();
+    second_thread.join();
+
+    std::set<uint64_t> all(first_frames.begin(), first_frames.end());
+    all.insert(second_frames.begin(), second_frames.end());
+    EXPECT_EQ(all.size(), 2u * kPerThread);
+    EXPECT_EQ(*all.rbegin(), (2u * kPerThread) - 1);
+}
+
+namespace {
+struct GlyphArt {
+    char character;
+    const char* rows[monitor::kGlyphHeight];
+};
+}  // namespace
+
+static const GlyphArt kExpectedGlyphs[] = {
+    {' ', {".....", ".....", ".....", ".....", ".....", ".....", "....."}},
+    {'0', {".###.", "#...#", "#..##", "#.#.#", "##..#", "#...#", ".###."}},
+    {'1', {"..#..", ".##..", "..#..", "..#..", "..#..", "..#..", ".###."}},
+    {'2', {".###.", "#...#", "....#", "...#.", "..#..", ".#...", "#####"}},
+    {'3', {"#####", "...#.", "..#..", "...#.", "....#", "#...#", ".###."}},
+    {'4', {"...#.", "..##.", ".#.#.", "#..#.", "#####", "...#.", "...#."}},
+    {'5', {"#####", "#....", "####.", "....#", "....#", "#...#", ".###."}},
+    {'6', {"..##.", ".#...", "#....", "####.", "#...#", "#...#", ".###."}},
+    {'7', {"#####", "....#", "...#.", "..#..", ".#...", ".#...", ".#..."}},
+    {'8', {".###.", "#...#", "#...#", ".###.", "#...#", "#...#", ".###."}},
+    {'9', {".###.", "#...#", "#...#", ".####", "....#", "...#.", ".##.."}},
+    {'.', {".....", ".....", ".....", ".....", ".....", ".##..", ".##.."}},
+    {'-', {".....", ".....", ".....", ".###.", ".....", ".....", "....."}},
+    {'(', {"...#.", "..#..", ".#...", ".#...", ".#...", "..#..", "...#."}},
+    {')', {".#...", "..#..", "...#.", "...#.", "...#.", "..#..", ".#..."}},
+    {'F', {"#####", "#....", "#....", "####.", "#....", "#....", "#...."}},
+    {'P', {"####.", "#...#", "#...#", "####.", "#....", "#....", "#...."}},
+    {'S', {".####", "#....", "#....", ".###.", "....#", "....#", "####."}},
+    {'a', {".....", ".....", ".###.", "....#", ".####", "#...#", ".####"}},
+    {'e', {".....", ".....", ".###.", "#...#", "#####", "#....", ".###."}},
+    {'m', {".....", ".....", "##.#.", "#.#.#", "#.#.#", "#...#", "#...#"}},
+    {'r', {".....", ".....", "#.##.", "##..#", "#....", "#....", "#...."}},
+    {'s', {".....", ".....", ".####", "#....", ".###.", "....#", "####."}},
+};
+
+static std::string GlyphRowArt(uint8_t glyph, int row) {
+    std::string art;
+    const uint8_t bits = monitor::GlyphRow(glyph, row);
+    for (int x = 0; x < monitor::kGlyphWidth; ++x) {
+        art += ((bits & (1u << (monitor::kGlyphWidth - 1 - x))) != 0u) ? '#' : '.';
+    }
+    return art;
+}
+
+TEST(MonitorOverlay, FontDrawsEveryGlyph) {
+    std::set<uint8_t> indices;
+    for (const GlyphArt& expected : kExpectedGlyphs) {
+        const uint8_t glyph = monitor::GlyphIndex(expected.character);
+        indices.insert(glyph);
+        for (int row = 0; row < monitor::kGlyphHeight; ++row) {
+            EXPECT_EQ(GlyphRowArt(glyph, row), expected.rows[row]) << "glyph '" << expected.character << "' row " << row;
+        }
+    }
+    EXPECT_EQ(indices.size(), std::size(kExpectedGlyphs));
+    EXPECT_EQ(static_cast<size_t>(monitor::kGlyphCount), std::size(kExpectedGlyphs));
+}
+
+TEST(MonitorOverlay, FontDrawsUnknownCharactersBlank) {
+    EXPECT_EQ(monitor::GlyphIndex('?'), monitor::GlyphIndex(' '));
+    EXPECT_EQ(monitor::GlyphIndex('Z'), monitor::GlyphIndex(' '));
+    EXPECT_EQ(monitor::GlyphIndex('\0'), monitor::GlyphIndex(' '));
+}
+
+static monitor::StatsSnapshot Snapshot(double fps, double avg_ms, double min_ms, double max_ms) {
+    monitor::StatsSnapshot snapshot;
+    snapshot.valid = true;
+    snapshot.fps = fps;
+    snapshot.avg_ms = avg_ms;
+    snapshot.min_ms = min_ms;
+    snapshot.max_ms = max_ms;
+    return snapshot;
+}
+
+TEST(MonitorOverlay, TextShowsAllLines) {
+    const auto lines = monitor::FormatOverlayLines(Snapshot(143.24, 6.981, 6.1, 9.4), 123456, monitor::LineFlags{});
+    const std::vector<std::string> expected = {"FPS 143.2", "6.98 ms (6.10-9.40)", "Frame 123456"};
+    EXPECT_EQ(lines, expected);
+}
+
+TEST(MonitorOverlay, TextShowsPlaceholdersBeforeFirstInterval) {
+    const auto lines = monitor::FormatOverlayLines(monitor::StatsSnapshot{}, 0, monitor::LineFlags{});
+    const std::vector<std::string> expected = {"FPS -", "- ms", "Frame 0"};
+    EXPECT_EQ(lines, expected);
+}
+
+TEST(MonitorOverlay, TextOmitsHiddenLines) {
+    monitor::LineFlags flags;
+    flags.fps = false;
+    flags.frame_time = false;
+    EXPECT_EQ(monitor::FormatOverlayLines(Snapshot(60, 16.67, 16, 17), 42, flags), std::vector<std::string>{"Frame 42"});
+
+    flags = monitor::LineFlags{};
+    flags.frame_number = false;
+    EXPECT_EQ(monitor::FormatOverlayLines(Snapshot(60, 16.67, 16, 17), 42, flags).size(), 2u);
+
+    flags.fps = false;
+    flags.frame_time = false;
+    EXPECT_TRUE(monitor::FormatOverlayLines(Snapshot(60, 16.67, 16, 17), 42, flags).empty());
+}
+
+static const std::vector<std::string> kThreeLines = {"FPS 143.2", "6.98 ms (6.10-9.40)", "Frame 123456"};
+
+static std::vector<int32_t> Rect(const int32_t rect[4]) { return {rect[0], rect[1], rect[2], rect[3]}; }
+
+TEST(MonitorOverlay, LayoutTopLeftAtDefaultScale) {
+    const auto layout = monitor::ComputeOverlayLayout({1920, 1080}, monitor::Position::TopLeft, 100,
+                                                      VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR, kThreeLines);
+    // 2 image pixels per font pixel, 4 font pixels of margin, 19 characters by 3 lines plus padding.
+    EXPECT_EQ(layout.pixel_size, 2u);
+    EXPECT_EQ(Rect(layout.visible_rect), (std::vector<int32_t>{8, 8, 8 + 238, 8 + 62}));
+    EXPECT_EQ(Rect(layout.image_rect), Rect(layout.visible_rect));
+    EXPECT_EQ(layout.rotation, 0u);
+    EXPECT_FALSE(layout.transform_warning);
+}
+
+TEST(MonitorOverlay, LayoutPlacesEachCorner) {
+    const VkExtent2D extent = {1920, 1080};
+    const auto top_left =
+        monitor::ComputeOverlayLayout(extent, monitor::Position::TopLeft, 100, VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR, kThreeLines);
+    const int32_t w = top_left.visible_rect[2] - top_left.visible_rect[0];
+    const int32_t h = top_left.visible_rect[3] - top_left.visible_rect[1];
+
+    const auto top_right =
+        monitor::ComputeOverlayLayout(extent, monitor::Position::TopRight, 100, VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR, kThreeLines);
+    EXPECT_EQ(Rect(top_right.visible_rect), (std::vector<int32_t>{1920 - 8 - w, 8, 1920 - 8, 8 + h}));
+
+    const auto bottom_left = monitor::ComputeOverlayLayout(extent, monitor::Position::BottomLeft, 100,
+                                                           VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR, kThreeLines);
+    EXPECT_EQ(Rect(bottom_left.visible_rect), (std::vector<int32_t>{8, 1080 - 8 - h, 8 + w, 1080 - 8}));
+
+    const auto bottom_right = monitor::ComputeOverlayLayout(extent, monitor::Position::BottomRight, 100,
+                                                            VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR, kThreeLines);
+    EXPECT_EQ(Rect(bottom_right.visible_rect), (std::vector<int32_t>{1920 - 8 - w, 1080 - 8 - h, 1920 - 8, 1080 - 8}));
+}
+
+TEST(MonitorOverlay, LayoutClampsScale) {
+    const auto layout = [](int scale) {
+        return monitor::ComputeOverlayLayout({1920, 1080}, monitor::Position::TopLeft, scale, VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR,
+                                             kThreeLines);
+    };
+    EXPECT_EQ(layout(10).pixel_size, 1u);
+    EXPECT_EQ(layout(50).pixel_size, 1u);
+    EXPECT_EQ(layout(75).pixel_size, 2u);
+    EXPECT_EQ(layout(200).pixel_size, 4u);
+    EXPECT_EQ(layout(400).pixel_size, 8u);
+    EXPECT_EQ(layout(1000).pixel_size, 8u);
+}
+
+TEST(MonitorOverlay, LayoutGrowsWithResolution) {
+    const auto pixel_size = [](VkExtent2D extent, int scale, VkSurfaceTransformFlagBitsKHR transform) {
+        return monitor::ComputeOverlayLayout(extent, monitor::Position::TopLeft, scale, transform, kThreeLines).pixel_size;
+    };
+    const VkSurfaceTransformFlagBitsKHR identity = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
+    EXPECT_EQ(pixel_size({500, 500}, 100, identity), 2u);
+    EXPECT_EQ(pixel_size({1920, 1080}, 100, identity), 2u);
+    EXPECT_EQ(pixel_size({3072, 1728}, 100, identity), 3u);
+    EXPECT_EQ(pixel_size({3840, 2160}, 100, identity), 4u);
+
+    // The shorter side counts, so a tall portrait image doesn't get huge text
+    EXPECT_EQ(pixel_size({1080, 2400}, 100, identity), 2u);
+    EXPECT_EQ(pixel_size({1080, 2400}, 100, VK_SURFACE_TRANSFORM_ROTATE_90_BIT_KHR), 2u);
+
+    // The scale setting applies on top
+    EXPECT_EQ(pixel_size({1920, 1080}, 50, identity), 1u);
+    EXPECT_EQ(pixel_size({3840, 2160}, 200, identity), 8u);
+}
+
+TEST(MonitorOverlay, LayoutStaysOnScreenWhenPanelIsTooBig) {
+    const auto layout = monitor::ComputeOverlayLayout({64, 32}, monitor::Position::BottomRight, 400,
+                                                      VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR, kThreeLines);
+    EXPECT_GE(layout.visible_rect[0], 0);
+    EXPECT_GE(layout.visible_rect[1], 0);
+}
+
+TEST(MonitorOverlay, LayoutClipsPanelToTheImage) {
+    // The image rect becomes a scissor, which must stay inside the image.
+    for (const VkSurfaceTransformFlagBitsKHR transform :
+         {VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR, VK_SURFACE_TRANSFORM_ROTATE_90_BIT_KHR, VK_SURFACE_TRANSFORM_ROTATE_180_BIT_KHR,
+          VK_SURFACE_TRANSFORM_ROTATE_270_BIT_KHR}) {
+        const VkExtent2D image = {48, 100};
+        const auto layout = monitor::ComputeOverlayLayout(image, monitor::Position::TopLeft, 400, transform, kThreeLines);
+        EXPECT_LE(layout.visible_rect[2], static_cast<int32_t>(layout.visible_extent.width)) << transform;
+        EXPECT_LE(layout.visible_rect[3], static_cast<int32_t>(layout.visible_extent.height)) << transform;
+        EXPECT_GE(layout.image_rect[0], 0) << transform;
+        EXPECT_GE(layout.image_rect[1], 0) << transform;
+        EXPECT_LE(layout.image_rect[2], static_cast<int32_t>(image.width)) << transform;
+        EXPECT_LE(layout.image_rect[3], static_cast<int32_t>(image.height)) << transform;
+    }
+}
+
+// Image content is the visible content rotated clockwise by the swapchain's preTransform.
+TEST(MonitorOverlay, LayoutRotatesIntoImageSpace) {
+    struct Case {
+        VkSurfaceTransformFlagBitsKHR transform = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
+        uint32_t rotation = 0;
+        std::vector<int32_t> image_rect;
+    };
+    // Portrait-native 1080x2400 image shown in landscape; visible panel is {8, 8, 246, 70}.
+    const Case cases[] = {
+        {VK_SURFACE_TRANSFORM_ROTATE_90_BIT_KHR, 1, {1080 - 70, 8, 1080 - 8, 246}},
+        {VK_SURFACE_TRANSFORM_ROTATE_270_BIT_KHR, 3, {8, 2400 - 246, 70, 2400 - 8}},
+    };
+    for (const Case& test_case : cases) {
+        const auto layout =
+            monitor::ComputeOverlayLayout({1080, 2400}, monitor::Position::TopLeft, 100, test_case.transform, kThreeLines);
+        EXPECT_EQ(layout.visible_extent.width, 2400u);
+        EXPECT_EQ(layout.visible_extent.height, 1080u);
+        EXPECT_EQ(Rect(layout.visible_rect), (std::vector<int32_t>{8, 8, 246, 70}));
+        EXPECT_EQ(layout.rotation, test_case.rotation);
+        EXPECT_EQ(Rect(layout.image_rect), test_case.image_rect);
+        EXPECT_FALSE(layout.transform_warning);
+    }
+
+    const auto upside_down = monitor::ComputeOverlayLayout({1920, 1080}, monitor::Position::TopLeft, 100,
+                                                           VK_SURFACE_TRANSFORM_ROTATE_180_BIT_KHR, kThreeLines);
+    EXPECT_EQ(upside_down.rotation, 2u);
+    EXPECT_EQ(Rect(upside_down.image_rect), (std::vector<int32_t>{1920 - 246, 1080 - 70, 1920 - 8, 1080 - 8}));
+}
+
+TEST(MonitorOverlay, LayoutDrawsMirrorAndInheritTransformsUnmirrored) {
+    struct Case {
+        VkSurfaceTransformFlagBitsKHR transform = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
+        uint32_t rotation = 0;
+    };
+    const Case cases[] = {
+        {VK_SURFACE_TRANSFORM_HORIZONTAL_MIRROR_BIT_KHR, 0},
+        {VK_SURFACE_TRANSFORM_HORIZONTAL_MIRROR_ROTATE_90_BIT_KHR, 1},
+        {VK_SURFACE_TRANSFORM_HORIZONTAL_MIRROR_ROTATE_180_BIT_KHR, 2},
+        {VK_SURFACE_TRANSFORM_HORIZONTAL_MIRROR_ROTATE_270_BIT_KHR, 3},
+        {VK_SURFACE_TRANSFORM_INHERIT_BIT_KHR, 0},
+    };
+    for (const Case& test_case : cases) {
+        const auto layout =
+            monitor::ComputeOverlayLayout({1920, 1080}, monitor::Position::TopLeft, 100, test_case.transform, kThreeLines);
+        EXPECT_EQ(layout.rotation, test_case.rotation) << test_case.transform;
+        EXPECT_TRUE(layout.transform_warning) << test_case.transform;
+    }
+}
+
+// Glyph k of line i is byte (i * kMaxColumns + k) of glyphs[], little-endian within each uint32_t.
+static uint8_t PackedGlyph(const monitor::OverlayPushConstants& push_constants, uint32_t line, uint32_t column) {
+    const uint32_t byte = (line * monitor::kMaxColumns) + column;
+    return static_cast<uint8_t>(push_constants.glyphs[byte / 4] >> ((byte % 4) * 8));
+}
+
+TEST(MonitorOverlay, PushConstantsFitTheGuaranteedLimit) { EXPECT_EQ(sizeof(monitor::OverlayPushConstants), 128u); }
+
+TEST(MonitorOverlay, PushConstantsEncodeLayout) {
+    const auto layout = monitor::ComputeOverlayLayout({1080, 2400}, monitor::Position::TopLeft, 200,
+                                                      VK_SURFACE_TRANSFORM_ROTATE_90_BIT_KHR, kThreeLines);
+    const auto push_constants = monitor::PackOverlayPushConstants(layout, kThreeLines, 2.5f, true);
+
+    EXPECT_EQ(Rect(push_constants.visible_rect), Rect(layout.visible_rect));
+    EXPECT_EQ(push_constants.visible_extent & 0xFFFF, 2400u);
+    EXPECT_EQ(push_constants.visible_extent >> 16, 1080u);
+    EXPECT_EQ(push_constants.params & 0xFF, 4u);         // pixel size
+    EXPECT_EQ((push_constants.params >> 8) & 0x3, 1u);   // rotation
+    EXPECT_EQ((push_constants.params >> 10) & 0x3, 3u);  // line count
+    EXPECT_EQ((push_constants.params >> 12) & 0x1, 1u);  // opaque
+    EXPECT_FLOAT_EQ(push_constants.white, 2.5f);
+
+    const auto blended = monitor::PackOverlayPushConstants(layout, kThreeLines, 1.0f, false);
+    EXPECT_EQ((blended.params >> 12) & 0x1, 0u);
+}
+
+TEST(MonitorOverlay, PushConstantsEncodeGlyphs) {
+    const auto layout = monitor::ComputeOverlayLayout({1920, 1080}, monitor::Position::TopLeft, 100,
+                                                      VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR, kThreeLines);
+    const auto push_constants = monitor::PackOverlayPushConstants(layout, kThreeLines, 1.0f, false);
+
+    for (uint32_t line = 0; line < kThreeLines.size(); ++line) {
+        for (uint32_t column = 0; column < monitor::kMaxColumns; ++column) {
+            const char expected = column < kThreeLines[line].size() ? kThreeLines[line][column] : ' ';
+            EXPECT_EQ(PackedGlyph(push_constants, line, column), monitor::GlyphIndex(expected))
+                << "line " << line << " column " << column;
+        }
+    }
+}
+
+TEST(MonitorOverlay, PushConstantsTruncateLongText) {
+    const std::vector<std::string> lines = {std::string(40, '1'), "2", "3", "4"};
+    const auto layout =
+        monitor::ComputeOverlayLayout({1920, 1080}, monitor::Position::TopLeft, 100, VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR, lines);
+    const auto push_constants = monitor::PackOverlayPushConstants(layout, lines, 1.0f, false);
+
+    EXPECT_EQ((push_constants.params >> 10) & 0x3, 3u);
+    EXPECT_EQ(PackedGlyph(push_constants, 0, monitor::kMaxColumns - 1), monitor::GlyphIndex('1'));
+    EXPECT_EQ(PackedGlyph(push_constants, 1, 0), monitor::GlyphIndex('2'));
+    EXPECT_EQ(PackedGlyph(push_constants, 2, 0), monitor::GlyphIndex('3'));
+
+    // The panel is sized for the text that is actually drawn.
+    const std::vector<std::string> drawn = {std::string(monitor::kMaxColumns, '1'), "2", "3"};
+    const auto drawn_layout =
+        monitor::ComputeOverlayLayout({1920, 1080}, monitor::Position::TopLeft, 100, VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR, drawn);
+    EXPECT_EQ(Rect(layout.visible_rect), Rect(drawn_layout.visible_rect));
+}
+
+TEST(MonitorOverlay, WhiteIsOneForSdrColorSpaces) {
+    const VkColorSpaceKHR sdr[] = {
+        VK_COLOR_SPACE_SRGB_NONLINEAR_KHR,          VK_COLOR_SPACE_DISPLAY_P3_NONLINEAR_EXT, VK_COLOR_SPACE_DISPLAY_P3_LINEAR_EXT,
+        VK_COLOR_SPACE_DCI_P3_NONLINEAR_EXT,        VK_COLOR_SPACE_BT709_LINEAR_EXT,         VK_COLOR_SPACE_BT709_NONLINEAR_EXT,
+        VK_COLOR_SPACE_BT2020_LINEAR_EXT,           VK_COLOR_SPACE_ADOBERGB_LINEAR_EXT,      VK_COLOR_SPACE_ADOBERGB_NONLINEAR_EXT,
+        VK_COLOR_SPACE_EXTENDED_SRGB_NONLINEAR_EXT,
+    };
+    for (const VkColorSpaceKHR color_space : sdr) {
+        const auto white = monitor::WhiteForColorSpace(color_space);
+        EXPECT_FLOAT_EQ(white.value, 1.0f) << color_space;
+        EXPECT_TRUE(white.known) << color_space;
+    }
+}
+
+TEST(MonitorOverlay, WhiteIsAbout200NitsForHdrColorSpaces) {
+    const auto scrgb = monitor::WhiteForColorSpace(VK_COLOR_SPACE_EXTENDED_SRGB_LINEAR_EXT);
+    EXPECT_FLOAT_EQ(scrgb.value, 2.5f);  // 1.0 is 80 nits
+    EXPECT_TRUE(scrgb.known);
+
+    const auto pq_white = monitor::WhiteForColorSpace(VK_COLOR_SPACE_HDR10_ST2084_EXT);
+    EXPECT_NEAR(pq_white.value, 0.5791f, 0.0001f);  // ST 2084 encoding of 200 nits
+    EXPECT_TRUE(pq_white.known);
+
+    const auto hlg = monitor::WhiteForColorSpace(VK_COLOR_SPACE_HDR10_HLG_EXT);
+    EXPECT_FLOAT_EQ(hlg.value, 0.75f);  // BT.2408 reference white
+    EXPECT_TRUE(hlg.known);
+}
+
+TEST(MonitorOverlay, WhiteFallsBackToOneForUnknownColorSpaces) {
+    for (const VkColorSpaceKHR color_space :
+         {VK_COLOR_SPACE_PASS_THROUGH_EXT, VK_COLOR_SPACE_DISPLAY_NATIVE_AMD, static_cast<VkColorSpaceKHR>(0x7FFF0000)}) {
+        const auto white = monitor::WhiteForColorSpace(color_space);
+        EXPECT_FLOAT_EQ(white.value, 1.0f) << color_space;
+        EXPECT_FALSE(white.known) << color_space;
+    }
+}
+
+static VkSwapchainCreateInfoKHR SwapchainInfo() {
+    VkSwapchainCreateInfoKHR info = {VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR};
+    info.imageFormat = VK_FORMAT_B8G8R8A8_SRGB;
+    info.imageColorSpace = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
+    info.imageExtent = {1920, 1080};
+    info.imageArrayLayers = 1;
+    info.imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+    info.preTransform = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
+    info.presentMode = VK_PRESENT_MODE_FIFO_KHR;
+    return info;
+}
+
+TEST(MonitorOverlay, PatchAddsColorAttachmentUsage) {
+    VkImageFormatListCreateInfo format_list = {VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO};
+    VkSwapchainCreateInfoKHR info = SwapchainInfo();
+    info.pNext = &format_list;
+    info.imageUsage = VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+
+    const VkSwapchainCreateInfoKHR patched = monitor::PatchSwapchainCreateInfo(info);
+    EXPECT_EQ(patched.imageUsage, VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT);
+    EXPECT_EQ(patched.pNext, &format_list);
+    EXPECT_EQ(patched.imageFormat, info.imageFormat);
+    EXPECT_EQ(patched.presentMode, info.presentMode);
+    EXPECT_EQ(info.imageUsage, VK_IMAGE_USAGE_TRANSFER_DST_BIT);  // The app's struct is untouched
+}
+
+TEST(MonitorOverlay, EligibleForRegularSwapchains) {
+    const auto eligibility = monitor::SwapchainOverlayEligibility(SwapchainInfo());
+    EXPECT_TRUE(eligibility.ok);
+    EXPECT_FALSE(eligibility.deferred);
+}
+
+TEST(MonitorOverlay, NotEligibleForSharedPresentModes) {
+    for (const VkPresentModeKHR mode : {VK_PRESENT_MODE_SHARED_DEMAND_REFRESH_KHR, VK_PRESENT_MODE_SHARED_CONTINUOUS_REFRESH_KHR}) {
+        VkSwapchainCreateInfoKHR info = SwapchainInfo();
+        info.presentMode = mode;
+        const auto eligibility = monitor::SwapchainOverlayEligibility(info);
+        EXPECT_FALSE(eligibility.ok);
+        EXPECT_NE(eligibility.reason, nullptr);
+    }
+}
+
+TEST(MonitorOverlay, NotEligibleForProtectedSwapchains) {
+    VkSwapchainCreateInfoKHR info = SwapchainInfo();
+    info.flags = VK_SWAPCHAIN_CREATE_PROTECTED_BIT_KHR;
+    const auto eligibility = monitor::SwapchainOverlayEligibility(info);
+    EXPECT_FALSE(eligibility.ok);
+    EXPECT_NE(eligibility.reason, nullptr);
+}
+
+TEST(MonitorOverlay, EligibleWithDeferredMemoryAllocation) {
+    VkSwapchainCreateInfoKHR info = SwapchainInfo();
+    info.flags = VK_SWAPCHAIN_CREATE_DEFERRED_MEMORY_ALLOCATION_BIT_KHR;
+    const auto eligibility = monitor::SwapchainOverlayEligibility(info);
+    EXPECT_TRUE(eligibility.ok);
+    EXPECT_TRUE(eligibility.deferred);
+}
+
+TEST(MonitorOverlay, DrawsOnlyOnGraphicsQueuesWithSomethingToShow) {
+    EXPECT_TRUE(monitor::ShouldDrawOverlay(VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT, true, true));
+    EXPECT_FALSE(monitor::ShouldDrawOverlay(VK_QUEUE_COMPUTE_BIT | VK_QUEUE_TRANSFER_BIT, true, true));
+    EXPECT_FALSE(monitor::ShouldDrawOverlay(VK_QUEUE_GRAPHICS_BIT, false, true));
+    EXPECT_FALSE(monitor::ShouldDrawOverlay(VK_QUEUE_GRAPHICS_BIT, true, false));
+}
+
+TEST(MonitorOverlay, SettingsDefaults) {
+    const monitor::MonitorSettings settings = monitor::ParseSettings(monitor::RawSettings{});
+    EXPECT_EQ(settings.position, monitor::Position::TopLeft);
+    EXPECT_EQ(settings.scale_percent, 100);
+    EXPECT_EQ(settings.update_interval, 500ms);
+    EXPECT_TRUE(settings.lines.fps);
+    EXPECT_TRUE(settings.lines.frame_time);
+    EXPECT_TRUE(settings.lines.frame_number);
+}
+
+TEST(MonitorOverlay, SettingsParsePositions) {
+    const std::pair<const char*, monitor::Position> cases[] = {
+        {"TOP_LEFT", monitor::Position::TopLeft},       {"TOP_RIGHT", monitor::Position::TopRight},
+        {"BOTTOM_LEFT", monitor::Position::BottomLeft}, {"BOTTOM_RIGHT", monitor::Position::BottomRight},
+        {"MIDDLE", monitor::Position::TopLeft},         {"", monitor::Position::TopLeft},
+    };
+    for (const auto& test_case : cases) {
+        monitor::RawSettings raw;
+        raw.position = test_case.first;
+        EXPECT_EQ(monitor::ParseSettings(raw).position, test_case.second) << test_case.first;
+    }
+}
+
+TEST(MonitorOverlay, SettingsClampNumbers) {
+    monitor::RawSettings raw;
+    raw.scale = 10;
+    raw.update_interval_ms = 1;
+    monitor::MonitorSettings settings = monitor::ParseSettings(raw);
+    EXPECT_EQ(settings.scale_percent, 50);
+    EXPECT_EQ(settings.update_interval, 50ms);
+
+    raw.scale = 1000;
+    raw.update_interval_ms = -5;
+    settings = monitor::ParseSettings(raw);
+    EXPECT_EQ(settings.scale_percent, 400);
+    EXPECT_EQ(settings.update_interval, 50ms);
+
+    raw.scale = 150;
+    raw.update_interval_ms = 2000;
+    settings = monitor::ParseSettings(raw);
+    EXPECT_EQ(settings.scale_percent, 150);
+    EXPECT_EQ(settings.update_interval, 2000ms);
+}
+
+TEST(MonitorOverlay, SettingsHideLines) {
+    monitor::RawSettings raw;
+    raw.show_fps = false;
+    raw.show_frame_number = false;
+    const monitor::MonitorSettings settings = monitor::ParseSettings(raw);
+    EXPECT_FALSE(settings.lines.fps);
+    EXPECT_TRUE(settings.lines.frame_time);
+    EXPECT_FALSE(settings.lines.frame_number);
+}
+
+TEST(MonitorOverlay, TextUsesOnlyDrawableCharacters) {
+    const auto lines = monitor::FormatOverlayLines(Snapshot(1234.5, 0.81, 0.5, 12345.67), UINT64_MAX, monitor::LineFlags{});
+    for (const std::string& line : lines) {
+        for (const char character : line) {
+            EXPECT_TRUE(character == ' ' || monitor::GlyphIndex(character) != monitor::GlyphIndex(' '))
+                << "'" << character << "' in " << line;
+        }
+    }
+}

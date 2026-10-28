@@ -95,6 +95,8 @@ if(BUILD_MONITOR)
     set_target_properties(VkLayer_monitor PROPERTIES FOLDER "layers/monitor")
     target_sources(VkLayer_monitor PRIVATE
         monitor.cpp
+        monitor_overlay.cpp
+        monitor_overlay.h
         vk_layer_table.cpp
         vk_layer_table.h
         monitor_layer.md
@@ -116,7 +118,7 @@ if(BUILD_SCREENSHOT)
     )
 endif()
 
-if (BUILD_TESTS AND NOT RUN_ON_GITHUB)
+if (BUILD_TESTS)
     add_subdirectory(test)
 endif()
 
