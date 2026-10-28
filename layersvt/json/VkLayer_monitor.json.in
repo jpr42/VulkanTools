@@ -5,9 +5,9 @@
         "type": "GLOBAL",
         "library_path": "@JSON_LIBRARY_PATH@",
         "api_version": "@JSON_VERSION@",
-        "implementation_version": "1",
+        "implementation_version": "2",
         "description": "Execution Monitoring Layer",
-        "introduction": "The monitor utility layer displays the real-time frame rate in frames-per-second in the application's title bar.",
+        "introduction": "The monitor utility layer draws the frame rate, frame time and frame number on top of the images the application presents.",
         "url": "https://vulkan.lunarg.com/doc/sdk/latest/windows/monitor_layer.html",
         "platforms": [ "WINDOWS", "LINUX" ],
         "instance_extensions": [

@@ -149,18 +149,37 @@ class MonitorSwapchainTests : public VkTestFramework {
             device_extensions.push_back(VK_KHR_DISPLAY_SWAPCHAIN_EXTENSION_NAME);
         }
 
+        // Family 0 can draw. If there is a family without graphics, a queue from it is in no_graphics_queue.
+        uint32_t family_count = 0;
+        vkGetPhysicalDeviceQueueFamilyProperties(physical_device, &family_count, nullptr);
+        std::vector<VkQueueFamilyProperties> families(family_count);
+        vkGetPhysicalDeviceQueueFamilyProperties(physical_device, &family_count, families.data());
+        uint32_t no_graphics_family = UINT32_MAX;
+        for (uint32_t i = 1; i < family_count && no_graphics_family == UINT32_MAX; ++i) {
+            if ((families[i].queueFlags & VK_QUEUE_GRAPHICS_BIT) == 0u) {
+                no_graphics_family = i;
+            }
+        }
+
         const float priority = 1.0f;
-        VkDeviceQueueCreateInfo queue_info = {VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
-        queue_info.queueFamilyIndex = 0;
-        queue_info.queueCount = 1;
-        queue_info.pQueuePriorities = &priority;
+        VkDeviceQueueCreateInfo queue_infos[2] = {{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO},
+                                                  {VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO}};
+        queue_infos[0].queueFamilyIndex = 0;
+        queue_infos[0].queueCount = 1;
+        queue_infos[0].pQueuePriorities = &priority;
+        queue_infos[1].queueFamilyIndex = no_graphics_family;
+        queue_infos[1].queueCount = 1;
+        queue_infos[1].pQueuePriorities = &priority;
         VkDeviceCreateInfo device_info = {VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
-        device_info.queueCreateInfoCount = 1;
-        device_info.pQueueCreateInfos = &queue_info;
+        device_info.queueCreateInfoCount = no_graphics_family == UINT32_MAX ? 1 : 2;
+        device_info.pQueueCreateInfos = queue_infos;
         device_info.enabledExtensionCount = static_cast<uint32_t>(device_extensions.size());
         device_info.ppEnabledExtensionNames = device_extensions.data();
         ASSERT_EQ(vkCreateDevice(physical_device, &device_info, nullptr, &device), VK_SUCCESS);
         vkGetDeviceQueue(device, 0, 0, &queue);
+        if (no_graphics_family != UINT32_MAX) {
+            vkGetDeviceQueue(device, no_graphics_family, 0, &no_graphics_queue);
+        }
 
         auto create_surface = reinterpret_cast<PFN_vkCreateHeadlessSurfaceEXT>(
             vkGetInstanceProcAddr(inst_builder.GetInstance(), "vkCreateHeadlessSurfaceEXT"));
@@ -204,23 +223,40 @@ class MonitorSwapchainTests : public VkTestFramework {
         return info;
     }
 
-    VkResult Present(VkSwapchainKHR swapchain) {
-        uint32_t index = 0;
-        VkResult result = vkAcquireNextImageKHR(device, swapchain, UINT64_MAX, VK_NULL_HANDLE, acquired, &index);
-        if (result != VK_SUCCESS) return result;
-        vkWaitForFences(device, 1, &acquired, VK_TRUE, UINT64_MAX);
-        vkResetFences(device, 1, &acquired);
+    VkResult Present(VkSwapchainKHR swapchain) { return Present(std::vector<VkSwapchainKHR>{swapchain}, queue); }
+
+    // Acquires an image from each swapchain and presents them all at once. With `rendered`, the present waits on it,
+    // the way an app waits for its rendering.
+    VkResult Present(const std::vector<VkSwapchainKHR>& swapchains, VkQueue present_queue, VkSemaphore rendered = VK_NULL_HANDLE) {
+        std::vector<uint32_t> indices(swapchains.size());
+        for (size_t i = 0; i < swapchains.size(); ++i) {
+            const VkResult result = vkAcquireNextImageKHR(device, swapchains[i], UINT64_MAX, VK_NULL_HANDLE, acquired, &indices[i]);
+            if (result != VK_SUCCESS) {
+                return result;
+            }
+            vkWaitForFences(device, 1, &acquired, VK_TRUE, UINT64_MAX);
+            vkResetFences(device, 1, &acquired);
+        }
+        if (rendered) {
+            VkSubmitInfo submit = {VK_STRUCTURE_TYPE_SUBMIT_INFO};
+            submit.signalSemaphoreCount = 1;
+            submit.pSignalSemaphores = &rendered;
+            vkQueueSubmit(present_queue, 1, &submit, VK_NULL_HANDLE);
+        }
         VkPresentInfoKHR present = {VK_STRUCTURE_TYPE_PRESENT_INFO_KHR};
-        present.swapchainCount = 1;
-        present.pSwapchains = &swapchain;
-        present.pImageIndices = &index;
-        return vkQueuePresentKHR(queue, &present);
+        present.waitSemaphoreCount = rendered ? 1 : 0;
+        present.pWaitSemaphores = &rendered;
+        present.swapchainCount = static_cast<uint32_t>(swapchains.size());
+        present.pSwapchains = swapchains.data();
+        present.pImageIndices = indices.data();
+        return vkQueuePresentKHR(present_queue, &present);
     }
 
     layer_test::VulkanInstanceBuilder inst_builder;
     VkPhysicalDevice physical_device = VK_NULL_HANDLE;
     VkDevice device = VK_NULL_HANDLE;
     VkQueue queue = VK_NULL_HANDLE;
+    VkQueue no_graphics_queue = VK_NULL_HANDLE;
     VkSurfaceKHR surface = VK_NULL_HANDLE;
     VkFence acquired = VK_NULL_HANDLE;
 };
@@ -320,4 +356,115 @@ TEST_F(MonitorSwapchainTests, SharedSwapchainsWarnOnce) {
     ASSERT_EQ(create_shared(device, 1, &info, nullptr, &swapchain), VK_SUCCESS);
     DestroySwapchain(swapchain);
     EXPECT_NE(testing::internal::GetCapturedStderr().find("vkCreateSharedSwapchainsKHR"), std::string::npos);
+}
+
+TEST_F(MonitorSwapchainTests, PresentTwoSwapchainsAtOnce) {
+    TEST_DESCRIPTION("One present call can show the overlay on several swapchains");
+
+    const VkSwapchainCreateInfoKHR info = SwapchainInfo();
+    VkSwapchainKHR first = VK_NULL_HANDLE;
+    VkSwapchainKHR second = VK_NULL_HANDLE;
+    ASSERT_EQ(vkCreateSwapchainKHR(device, &info, nullptr, &first), VK_SUCCESS);
+    ASSERT_EQ(vkCreateSwapchainKHR(device, &info, nullptr, &second), VK_SUCCESS);
+    for (int i = 0; i < 5; ++i) {
+        EXPECT_EQ(Present({first, second}, queue), VK_SUCCESS);
+    }
+    DestroySwapchain(first);
+    DestroySwapchain(second);
+}
+
+TEST_F(MonitorSwapchainTests, PresentWaitsForTheApp) {
+    TEST_DESCRIPTION("The app's semaphores are still waited on when the overlay is drawn");
+
+    const VkSemaphoreCreateInfo semaphore_info = {VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
+    VkSemaphore rendered = VK_NULL_HANDLE;
+    ASSERT_EQ(vkCreateSemaphore(device, &semaphore_info, nullptr, &rendered), VK_SUCCESS);
+    const VkSwapchainCreateInfoKHR info = SwapchainInfo();
+    VkSwapchainKHR swapchain = VK_NULL_HANDLE;
+    ASSERT_EQ(vkCreateSwapchainKHR(device, &info, nullptr, &swapchain), VK_SUCCESS);
+    for (int i = 0; i < 5; ++i) {
+        EXPECT_EQ(Present({swapchain}, queue, rendered), VK_SUCCESS);
+    }
+    DestroySwapchain(swapchain);
+    vkDestroySemaphore(device, rendered, nullptr);
+}
+
+TEST_F(MonitorSwapchainTests, PresentFromQueueWithoutGraphics) {
+    TEST_DESCRIPTION("A queue that can't draw presents as usual, and says once that there is no overlay");
+    if (!no_graphics_queue) {
+        GTEST_SKIP() << "every queue family has graphics";
+    }
+
+    testing::internal::CaptureStderr();
+    const VkSwapchainCreateInfoKHR info = SwapchainInfo();
+    VkSwapchainKHR swapchain = VK_NULL_HANDLE;
+    ASSERT_EQ(vkCreateSwapchainKHR(device, &info, nullptr, &swapchain), VK_SUCCESS);
+    for (int i = 0; i < 3; ++i) {
+        EXPECT_EQ(Present({swapchain}, no_graphics_queue), VK_SUCCESS);
+    }
+    DestroySwapchain(swapchain);
+
+    const std::string output = testing::internal::GetCapturedStderr();
+    const size_t first = output.find("without graphics");
+    EXPECT_NE(first, std::string::npos) << output;
+    EXPECT_EQ(output.find("without graphics", first + 1), std::string::npos) << output;
+}
+
+TEST_F(MonitorSwapchainTests, PresentFromTwoDevicesAtOnce) {
+    TEST_DESCRIPTION("Devices of one instance present from different threads, sharing the frame counter");
+
+    // A second device with its own swapchain, next to the fixture's
+    const float priority = 1.0f;
+    VkDeviceQueueCreateInfo queue_info = {VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
+    queue_info.queueCount = 1;
+    queue_info.pQueuePriorities = &priority;
+    const char* const extensions[] = {VK_KHR_SWAPCHAIN_EXTENSION_NAME};
+    VkDeviceCreateInfo device_info = {VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
+    device_info.queueCreateInfoCount = 1;
+    device_info.pQueueCreateInfos = &queue_info;
+    device_info.enabledExtensionCount = 1;
+    device_info.ppEnabledExtensionNames = extensions;
+    VkDevice other_device = VK_NULL_HANDLE;
+    ASSERT_EQ(vkCreateDevice(physical_device, &device_info, nullptr, &other_device), VK_SUCCESS);
+    VkQueue other_queue = VK_NULL_HANDLE;
+    vkGetDeviceQueue(other_device, 0, 0, &other_queue);
+
+    const VkSwapchainCreateInfoKHR info = SwapchainInfo();
+    VkSwapchainKHR swapchain = VK_NULL_HANDLE;
+    VkSwapchainKHR other_swapchain = VK_NULL_HANDLE;
+    ASSERT_EQ(vkCreateSwapchainKHR(device, &info, nullptr, &swapchain), VK_SUCCESS);
+    ASSERT_EQ(vkCreateSwapchainKHR(other_device, &info, nullptr, &other_swapchain), VK_SUCCESS);
+
+    std::atomic<int> failures{0};
+    std::thread other([&] {
+        const VkFenceCreateInfo fence_info = {VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+        VkFence fence = VK_NULL_HANDLE;
+        vkCreateFence(other_device, &fence_info, nullptr, &fence);
+        for (int i = 0; i < 50; ++i) {
+            uint32_t index = 0;
+            vkAcquireNextImageKHR(other_device, other_swapchain, UINT64_MAX, VK_NULL_HANDLE, fence, &index);
+            vkWaitForFences(other_device, 1, &fence, VK_TRUE, UINT64_MAX);
+            vkResetFences(other_device, 1, &fence);
+            VkPresentInfoKHR present = {VK_STRUCTURE_TYPE_PRESENT_INFO_KHR};
+            present.swapchainCount = 1;
+            present.pSwapchains = &other_swapchain;
+            present.pImageIndices = &index;
+            if (vkQueuePresentKHR(other_queue, &present) != VK_SUCCESS) {
+                ++failures;
+            }
+        }
+        vkDestroyFence(other_device, fence, nullptr);
+    });
+    for (int i = 0; i < 50; ++i) {
+        if (Present(swapchain) != VK_SUCCESS) {
+            ++failures;
+        }
+    }
+    other.join();
+    EXPECT_EQ(failures, 0);
+
+    DestroySwapchain(swapchain);
+    vkDeviceWaitIdle(other_device);
+    vkDestroySwapchainKHR(other_device, other_swapchain, nullptr);
+    vkDestroyDevice(other_device, nullptr);
 }

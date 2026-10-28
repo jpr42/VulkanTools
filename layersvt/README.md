@@ -31,7 +31,7 @@ layersvt/screenshot.cpp (name='VK_LAYER_LUNARG_screenshot') - utility layer used
 To specify frames to be captured, the environment variable 'VK_SCREENSHOT_FRAMES' can be set to a comma-separated list of frame numbers (ex: 4,8,15,16,23,42).
 
 ### View Frames Per Second
-layersvt/monitor.cpp - utility layer that will display an applications FPS in the title bar of a windowed application.
+layersvt/monitor.cpp - utility layer that draws an application's FPS, frame time and frame number on top of the images it presents.
 
 ## Using Layers
 

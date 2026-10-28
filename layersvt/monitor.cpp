@@ -25,7 +25,10 @@
 #include <assert.h>
 #include <stdlib.h>
 #include <string.h>
-#include <time.h>
+#include <atomic>
+#include <chrono>
+#include <cstdint>
+#include <cstdio>
 #include <memory>
 #include <mutex>
 #include <set>
@@ -43,43 +46,23 @@
 #include <android/log.h>
 #endif
 
-#if defined(__linux__)
-#include <dlfcn.h>
-#endif
-
-#if (!defined(VK_USE_PLATFORM_XCB_KHR) && !defined(VK_USE_PLATFORM_WIN32_KHR))
-#warning "Monitor layer only has code for XCB and Windows at this time"
-#endif
-
 #if defined(_WIN32) && !defined(NDEBUG)
 #include <crtdbg.h>
 #endif
 
-#define TITLE_LENGTH 1000
-#define FPS_LENGTH 24
 struct monitor_layer_data {
     VkuDeviceDispatchTable *device_dispatch_table{};
     VkuInstanceDispatchTable *instance_dispatch_table{};
 
-    PFN_vkQueuePresentKHR pfnQueuePresentKHR{};
-#if defined(VK_USE_PLATFORM_WIN32_KHR)
-    HWND hwnd{};
-#elif defined(VK_USE_PLATFORM_XCB_KHR)
-    xcb_connection_t *connection{};
-    xcb_window_t xcb_window{};
-    bool xcb_fps{};
-#endif
-    char base_title[TITLE_LENGTH]{};
-    bool got_title = false;
     VkInstance instance{};
     VkPhysicalDevice gpu{};
     VkDevice device{};
 
     PFN_vkSetDeviceLoaderData pfn_dev_init{};
-    int lastFrame{};
-    time_t lastTime{};
-    float fps{};
-    int frame{};
+
+    // Instance state for the overlay
+    std::atomic<uint64_t> frame_counter{0};
+    monitor::MonitorSettings settings;
 
     // Device state for the overlay, guarded by `lock`
     std::mutex lock;
@@ -87,19 +70,9 @@ struct monitor_layer_data {
     std::vector<VkQueueFamilyProperties> queue_families;
     std::unordered_map<VkQueue, uint32_t> queue_family_index;
     std::unordered_map<VkSwapchainKHR, std::unique_ptr<monitor::SwapchainOverlay>> swapchains;
+    std::unordered_map<uint32_t, monitor::SlotRing> slot_rings;  // By queue family
+    monitor::PresentRewrite present_rewrite;
 };
-
-#if defined(VK_USE_PLATFORM_XCB_KHR)
-static struct {
-    void *xcbLib{};
-    decltype(xcb_change_property) *change_property{};
-    decltype(xcb_flush) *flush{};
-    decltype(xcb_get_property) *get_property{};
-    decltype(xcb_get_property_reply) *get_property_reply{};
-    decltype(xcb_get_property_value_length) *get_property_value_length{};
-    decltype(xcb_get_property_value) *get_property_value{};
-} xcb = {NULL};
-#endif
 
 // Instances and devices are created and destroyed from any thread, so the map is always locked.
 static std::mutex layer_data_lock;
@@ -182,15 +155,6 @@ VKAPI_ATTR VkResult VKAPI_CALL vkCreateDevice(VkPhysicalDevice gpu, const VkDevi
     my_device_data->queue_families.resize(family_count);
     instance_data->instance_dispatch_table->GetPhysicalDeviceQueueFamilyProperties(gpu, &family_count,
                                                                                    my_device_data->queue_families.data());
-    my_device_data->frame = 0;
-    my_device_data->lastFrame = 0;
-    my_device_data->fps = 0.0;
-    time(&my_device_data->lastTime);
-
-    // Get our WSI hooks in
-    VkuDeviceDispatchTable *pTable = my_device_data->device_dispatch_table;
-    my_device_data->pfnQueuePresentKHR = (PFN_vkQueuePresentKHR)pTable->GetDeviceProcAddr(*pDevice, "vkQueuePresentKHR");
-
     return result;
 }
 
@@ -205,6 +169,10 @@ VKAPI_ATTR void VKAPI_CALL vkDestroyDevice(VkDevice device, const VkAllocationCa
             monitor::DestroySwapchainOverlay(device, *pTable, *swapchain.second);
         }
         my_data->swapchains.clear();
+        for (auto &ring : my_data->slot_rings) {
+            monitor::DestroySlotRing(device, *pTable, ring.second);
+        }
+        my_data->slot_rings.clear();
     }
     pTable->DestroyDevice(device, pAllocator);
     delete pTable;
@@ -245,32 +213,6 @@ VKAPI_ATTR VkResult VKAPI_CALL vkCreateInstance(const VkInstanceCreateInfo *pCre
     my_data->instance_dispatch_table = new VkuInstanceDispatchTable;
     vkuInitInstanceDispatchTable(*pInstance, my_data->instance_dispatch_table, fpGetInstanceProcAddr);
 
-#if defined(VK_USE_PLATFORM_XCB_KHR)
-    // Initialize connection to null in case vkCreateXcbSurfaceKHR is never called
-    my_data->connection = nullptr;
-    // Load the xcb library and initialize xcb function pointers
-    if (!xcb.xcbLib) {
-        xcb.xcbLib = dlopen("libxcb.so", RTLD_NOW | RTLD_LOCAL);
-        if (xcb.xcbLib) {
-            xcb.change_property = reinterpret_cast<decltype(xcb_change_property) *>(dlsym(xcb.xcbLib, "xcb_change_property"));
-            xcb.flush = reinterpret_cast<decltype(xcb_flush) *>(dlsym(xcb.xcbLib, "xcb_flush"));
-            xcb.get_property = reinterpret_cast<decltype(xcb_get_property) *>(dlsym(xcb.xcbLib, "xcb_get_property"));
-            xcb.get_property_reply =
-                reinterpret_cast<decltype(xcb_get_property_reply) *>(dlsym(xcb.xcbLib, "xcb_get_property_reply"));
-            xcb.get_property_value_length =
-                reinterpret_cast<decltype(xcb_get_property_value_length) *>(dlsym(xcb.xcbLib, "xcb_get_property_value_length"));
-            xcb.get_property_value =
-                reinterpret_cast<decltype(xcb_get_property_value) *>(dlsym(xcb.xcbLib, "xcb_get_property_value"));
-            if (!xcb.change_property || !xcb.flush || !xcb.get_property || !xcb.get_property_reply ||
-                !xcb.get_property_value_length || !xcb.get_property_value) {
-                // Something went wrong querying the entry points - set xcb.xdbLib to NULL
-                // to indicate we didn't successufly load libxcb.so
-                xcb.xcbLib = NULL;
-            }
-        }
-    }
-#endif
-
     return result;
 }
 
@@ -283,44 +225,113 @@ VKAPI_ATTR void VKAPI_CALL vkDestroyInstance(VkInstance instance, const VkAlloca
     FreeLayerData(key);
 }
 
+// Draws the overlay on every swapchain being presented, in one submit that waits for the app's work. The present then
+// waits for that submit instead.
 VKAPI_ATTR VkResult VKAPI_CALL vkQueuePresentKHR(VkQueue queue, const VkPresentInfoKHR *pPresentInfo) {
     monitor_layer_data *my_data = GetLayerData(get_dispatch_key(queue));
+    monitor_layer_data *instance_data = my_data->instance_data;
+    const VkuDeviceDispatchTable &dispatch = *my_data->device_dispatch_table;
+    const monitor::MonitorSettings &settings = instance_data->settings;
+    const uint64_t frame_number = monitor::NextFrameNumber(instance_data->frame_counter);
+    const auto now = std::chrono::steady_clock::now();
 
-    time_t now;
-    time(&now);
-    float seconds = (float)difftime(now, my_data->lastTime);
+    const std::scoped_lock lock(my_data->lock);
 
-    if (seconds > 0.5) {
-        char str[TITLE_LENGTH + FPS_LENGTH];
-        char fpsstr[FPS_LENGTH];
-        monitor_layer_data *my_instance_data = GetLayerData(get_dispatch_key(my_data->gpu));
-        my_data->fps = (my_data->frame - my_data->lastFrame) / seconds;
-        my_data->lastFrame = my_data->frame;
-        my_data->lastTime = now;
-#if defined(VK_USE_PLATFORM_WIN32_KHR)
-        if (IsWindow(my_instance_data->hwnd) && !my_instance_data->got_title) {
-            GetWindowText(my_instance_data->hwnd, my_instance_data->base_title, TITLE_LENGTH);
-            my_instance_data->got_title = true;
+    // Statistics are kept for every swapchain, even ones without an overlay
+    std::vector<monitor::SwapchainOverlay *> overlays(pPresentInfo->swapchainCount, nullptr);
+    std::vector<bool> drawn(pPresentInfo->swapchainCount, false);
+    bool any_overlay = false;
+    for (uint32_t i = 0; i < pPresentInfo->swapchainCount; ++i) {
+        auto it = my_data->swapchains.find(pPresentInfo->pSwapchains[i]);
+        if (it == my_data->swapchains.end()) {
+            continue;
         }
-#endif
-        sprintf(fpsstr, "   FPS = %.2f", my_data->fps);
-        strcpy(str, my_instance_data->base_title);
-        strcat(str, fpsstr);
-#if defined(VK_USE_PLATFORM_WIN32_KHR)
-        if (IsWindow(my_instance_data->hwnd)) {
-            SetWindowText(my_instance_data->hwnd, str);
+        monitor::RecordPresent(it->second->stats, now, settings.update_interval);
+        if (it->second->ok && monitor::PrepareImage(my_data->device, dispatch, *it->second, pPresentInfo->pImageIndices[i])) {
+            overlays[i] = it->second.get();
+            drawn[i] = true;
+            any_overlay = true;
         }
-#elif defined(VK_USE_PLATFORM_XCB_KHR)
-        if (xcb.xcbLib && my_instance_data->xcb_fps && my_instance_data->connection) {
-            xcb.change_property(my_instance_data->connection, XCB_PROP_MODE_REPLACE, my_instance_data->xcb_window, XCB_ATOM_WM_NAME,
-                                XCB_ATOM_STRING, 8, strlen(str), str);
-            xcb.flush(my_instance_data->connection);
-        }
-#endif
     }
-    my_data->frame++;
 
-    VkResult result = my_data->pfnQueuePresentKHR(queue, pPresentInfo);
+    const auto family = my_data->queue_family_index.find(queue);
+    const bool known_family = family != my_data->queue_family_index.end() && family->second < my_data->queue_families.size();
+    const VkQueueFlags queue_flags = known_family ? my_data->queue_families[family->second].queueFlags : 0;
+    const bool any_line = settings.lines.fps || settings.lines.frame_time || settings.lines.frame_number;
+    if (!known_family || !monitor::ShouldDrawOverlay(queue_flags, any_overlay, any_line)) {
+        if (any_overlay && any_line && ((queue_flags & VK_QUEUE_GRAPHICS_BIT) == 0u)) {
+            WarnOnce("no overlay when presenting from a queue without graphics");
+        }
+        return dispatch.QueuePresentKHR(queue, pPresentInfo);
+    }
+
+    monitor::SlotRing &ring = my_data->slot_rings[family->second];
+    if (!ring.ok && !ring.reason) {
+        monitor::CreateSlotRing(my_data->device, dispatch, family->second, my_data->pfn_dev_init, 3, ring);
+    }
+    if (!ring.ok) {
+        WarnOnce(std::string("no overlay, ") + (ring.reason ? ring.reason : "could not create command buffers"));
+        return dispatch.QueuePresentKHR(queue, pPresentInfo);
+    }
+
+    monitor::SubmitSlot &slot = monitor::AcquireSlot(my_data->device, dispatch, ring);
+    VkCommandBufferBeginInfo begin = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    if (dispatch.BeginCommandBuffer(slot.command_buffer, &begin) != VK_SUCCESS) {
+        WarnOnce("out of memory, some frames are presented without the overlay");
+        return dispatch.QueuePresentKHR(queue, pPresentInfo);
+    }
+
+    std::vector<VkSemaphore> signals;
+    std::vector<VkSwapchainKHR> swapchains;
+    for (uint32_t i = 0; i < pPresentInfo->swapchainCount; ++i) {
+        monitor::SwapchainOverlay *overlay = overlays[i];
+        if (!overlay) {
+            continue;
+        }
+        const monitor::SwapchainImage &image = overlay->images[pPresentInfo->pImageIndices[i]];
+
+        const std::vector<std::string> lines = monitor::FormatOverlayLines(overlay->stats.snapshot, frame_number, settings.lines);
+        const monitor::OverlayLayout layout =
+            monitor::ComputeOverlayLayout(overlay->extent, settings.position, settings.scale_percent, overlay->transform, lines);
+        const monitor::WhiteLevel white = monitor::WhiteForColorSpace(overlay->color_space);
+        if (layout.transform_warning) {
+            WarnOnce("mirrored swapchain transforms are drawn without the mirror");
+        }
+        if (!white.known) {
+            WarnOnce("unknown swapchain color space, the overlay may be too bright or too dark");
+        }
+
+        const monitor::OverlayPushConstants push_constants =
+            monitor::PackOverlayPushConstants(layout, lines, white.value, !overlay->blend);
+        monitor::RecordOverlay(dispatch, slot.command_buffer, overlay->pipeline, image.framebuffer, overlay->extent,
+                               layout.image_rect, push_constants);
+        signals.push_back(image.present_wait);
+        swapchains.push_back(overlay->swapchain);
+    }
+    if (dispatch.EndCommandBuffer(slot.command_buffer) != VK_SUCCESS) {
+        WarnOnce("out of memory, some frames are presented without the overlay");
+        return dispatch.QueuePresentKHR(queue, pPresentInfo);
+    }
+
+    const std::vector<VkSemaphore> waits(pPresentInfo->pWaitSemaphores,
+                                         pPresentInfo->pWaitSemaphores + pPresentInfo->waitSemaphoreCount);
+    VkResult result = monitor::SubmitOverlay(my_data->device, dispatch, queue, slot, waits, signals, swapchains);
+    if (result == VK_ERROR_OUT_OF_HOST_MEMORY || result == VK_ERROR_OUT_OF_DEVICE_MEMORY) {
+        // The app's semaphores weren't touched, so the frame can still be presented without the overlay
+        WarnOnce("out of memory, some frames are presented without the overlay");
+        return dispatch.QueuePresentKHR(queue, pPresentInfo);
+    }
+    if (result != VK_SUCCESS) {
+        return result;
+    }
+
+    const VkPresentInfoKHR &present_info = monitor::RewritePresentInfo(*pPresentInfo, signals, drawn, my_data->present_rewrite);
+    result = dispatch.QueuePresentKHR(queue, &present_info);
+    if (result == VK_ERROR_OUT_OF_HOST_MEMORY || result == VK_ERROR_OUT_OF_DEVICE_MEMORY) {
+        // Nothing waited on the overlay semaphores, so unsignal them before they are used again
+        monitor::DrainSemaphores(dispatch, queue, signals);
+    }
     return result;
 }
 
@@ -330,9 +341,10 @@ VKAPI_ATTR VkResult VKAPI_CALL vkGetPhysicalDeviceToolPropertiesEXT(VkPhysicalDe
         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TOOL_PROPERTIES_EXT,
         nullptr,
         "Monitor Layer",
-        "1",
+        "2",
         VK_TOOL_PURPOSE_PROFILING_BIT_EXT | VK_TOOL_PURPOSE_ADDITIONAL_FEATURES_BIT_EXT,
-        "The VK_LAYER_LUNARG_monitor utility layer prints the real-time frames-per-second value to the application's title bar.",
+        "The VK_LAYER_LUNARG_monitor utility layer draws the frame rate, frame time and frame number on top of the presented "
+        "images.",
         "VK_LAYER_LUNARG_monitor"};
 
     auto original_pToolProperties = pToolProperties;
@@ -354,53 +366,6 @@ VKAPI_ATTR VkResult VKAPI_CALL vkGetPhysicalDeviceToolPropertiesEXT(VkPhysicalDe
 
     return result;
 }
-
-#if defined(VK_USE_PLATFORM_WIN32_KHR)
-VKAPI_ATTR VkResult VKAPI_CALL vkCreateWin32SurfaceKHR(VkInstance instance, const VkWin32SurfaceCreateInfoKHR *pCreateInfo,
-                                                       const VkAllocationCallbacks *pAllocator, VkSurfaceKHR *pSurface) {
-    monitor_layer_data *my_data = GetLayerData(get_dispatch_key(instance));
-    my_data->hwnd = pCreateInfo->hwnd;
-
-    VkResult result = my_data->instance_dispatch_table->CreateWin32SurfaceKHR(instance, pCreateInfo, pAllocator, pSurface);
-    return result;
-}
-#elif defined(VK_USE_PLATFORM_XCB_KHR)
-VKAPI_ATTR VkResult VKAPI_CALL vkCreateXcbSurfaceKHR(VkInstance instance, const VkXcbSurfaceCreateInfoKHR *pCreateInfo,
-                                                     const VkAllocationCallbacks *pAllocator, VkSurfaceKHR *pSurface) {
-    static bool xcbErrorPrinted = false;  // Only print xcb error message once
-    xcb_get_property_cookie_t cookie;
-    xcb_get_property_reply_t *reply;
-    xcb_atom_t property = XCB_ATOM_WM_NAME;
-    xcb_atom_t type = XCB_ATOM_STRING;
-
-    monitor_layer_data *my_data = GetLayerData(get_dispatch_key(instance));
-
-    if (!xcb.xcbLib and !xcbErrorPrinted) {
-        fprintf(stderr, "Monitor layer libxcb.so load failure, will not be able to display frame rate\n");
-        xcbErrorPrinted = true;
-    }
-    if (xcb.xcbLib) {
-        my_data->xcb_window = pCreateInfo->window;
-        my_data->connection = pCreateInfo->connection;
-        cookie = xcb.get_property(my_data->connection, 0, my_data->xcb_window, property, type, 0, 0);
-        if ((reply = xcb.get_property_reply(my_data->connection, cookie, NULL))) {
-            my_data->xcb_fps = true;
-            int len = xcb.get_property_value_length(reply);
-            if (len > TITLE_LENGTH) {
-                my_data->xcb_fps = false;
-            } else if (len > 0) {
-                strcpy(my_data->base_title, (char *)xcb.get_property_value(reply));
-            } else {
-                // No window title - make base title null string
-                my_data->base_title[0] = 0;
-            }
-        }
-    }
-
-    VkResult result = my_data->instance_dispatch_table->CreateXcbSurfaceKHR(instance, pCreateInfo, pAllocator, pSurface);
-    return result;
-}
-#endif
 
 VKAPI_ATTR void VKAPI_CALL vkGetDeviceQueue(VkDevice device, uint32_t queueFamilyIndex, uint32_t queueIndex, VkQueue *pQueue) {
     monitor_layer_data *my_data = GetLayerData(get_dispatch_key(device));
@@ -455,6 +420,9 @@ VKAPI_ATTR void VKAPI_CALL vkDestroySwapchainKHR(VkDevice device, VkSwapchainKHR
         const std::scoped_lock lock(my_data->lock);
         auto it = my_data->swapchains.find(swapchain);
         if (it != my_data->swapchains.end()) {
+            for (auto &ring : my_data->slot_rings) {
+                monitor::WaitForSwapchain(device, dispatch, ring.second, swapchain);
+            }
             monitor::DestroySwapchainOverlay(device, dispatch, *it->second);
             my_data->swapchains.erase(it);
         }
@@ -519,11 +487,6 @@ EXPORT_FUNCTION VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vkGetInstanceProcAddr(V
     ADD_HOOK(vkDestroyInstance);
     ADD_HOOK(vkGetInstanceProcAddr);
     ADD_HOOK(vkGetPhysicalDeviceToolPropertiesEXT);
-#if defined(VK_USE_PLATFORM_WIN32_KHR)
-    ADD_HOOK(vkCreateWin32SurfaceKHR);
-#elif defined(VK_USE_PLATFORM_XCB_KHR)
-    ADD_HOOK(vkCreateXcbSurfaceKHR);
-#endif
 #undef ADD_HOOK
 
     if (instance == NULL) return NULL;
