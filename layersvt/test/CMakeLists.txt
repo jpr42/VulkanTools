@@ -96,6 +96,21 @@ if (TARGET VkLayer_monitor)
     add_test(NAME test_monitor_overlay COMMAND test_monitor_overlay)
     set_target_properties(test_monitor_overlay PROPERTIES FOLDER "layers/monitor/Test")
 
+    # Swapchain and present plumbing against a fake device
+    add_executable(test_monitor_present
+                   test_monitor_present.cpp
+                   ../monitor_present.cpp
+                   ../monitor_present.h
+                   ../monitor_renderer.cpp
+                   ../monitor_renderer.h
+                   ../monitor_overlay.cpp
+                   ../monitor_overlay.h
+                   layer_test_main.cpp)
+    target_include_directories(test_monitor_present PRIVATE ..)
+    target_link_libraries(test_monitor_present Vulkan::Headers Vulkan::UtilityHeaders GTest::gtest)
+    add_test(NAME test_monitor_present COMMAND test_monitor_present)
+    set_target_properties(test_monitor_present PROPERTIES FOLDER "layers/monitor/Test")
+
     # Draws the overlay with a real Vulkan driver, and skips without one
     add_executable(test_monitor_renderer
                    test_monitor_renderer.cpp
@@ -110,6 +125,6 @@ if (TARGET VkLayer_monitor)
     set_target_properties(test_monitor_renderer PROPERTIES FOLDER "layers/monitor/Test")
 
     if(WIN32 AND (QT_TARGET_TYPE STREQUAL STATIC_LIBRARY))
-      set_property(TARGET test_monitor_overlay test_monitor_renderer PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+      set_property(TARGET test_monitor_overlay test_monitor_present test_monitor_renderer PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
     endif()
 endif()

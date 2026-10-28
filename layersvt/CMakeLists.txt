@@ -98,6 +98,8 @@ if(BUILD_MONITOR)
         monitor_overlay.cpp
         monitor_overlay.h
         monitor_overlay_shaders.h
+        monitor_present.cpp
+        monitor_present.h
         monitor_renderer.cpp
         monitor_renderer.h
         shaders/monitor_overlay.vert
