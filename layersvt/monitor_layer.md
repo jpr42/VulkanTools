@@ -16,11 +16,26 @@ The `VK_LAYER_LUNARG_monitor` utility layer draws a small overlay in the corner 
 
 The overlay is drawn into the presented images, so it works in fullscreen and doesn't depend on the window system. The application's window title is left alone.
 
-The frame rate and frame times are measured between presents of each swapchain, and refresh twice a second. The frame number updates every frame.
+The frame rate and frame times are measured between presents of each swapchain, and refresh twice a second by default. The frame number updates every frame.
 
 For an overview of how to configure layers, refer to the [Layers Overview and Configuration](https://vulkan.lunarg.com/doc/sdk/latest/windows/layer_configuration.html) document.
 
 The Monitor Layer can be enabled using the [Vulkan Configurator](https://vulkan.lunarg.com/doc/sdk/latest/windows/vkconfig.html) included with the Vulkan SDK.
+
+## Layer Settings
+
+| Setting | Default | Description |
+|---|---|---|
+| `position` | `TOP_LEFT` | Corner the overlay is drawn in: `TOP_LEFT`, `TOP_RIGHT`, `BOTTOM_LEFT` or `BOTTOM_RIGHT`. |
+| `scale` | `100` | Size of the overlay text as a percentage of the default size, from 50 to 400. The default size grows with the resolution of the presented images. |
+| `update_interval_ms` | `500` | How often the frame rate and frame times are updated, at least 50. |
+| `show_fps` | `true` | Show the frame rate. |
+| `show_frame_time` | `true` | Show the frame times. |
+| `show_frame_number` | `true` | Show the frame number. |
+
+The settings can be set with the Vulkan Configurator, `vk_layer_settings.txt`, environment variables such as `VK_LUNARG_MONITOR_POSITION=BOTTOM_RIGHT`, or `VK_EXT_layer_settings`. The layer option details are in the [monitor layer documentation](https://vulkan.lunarg.com/doc/sdk/latest/windows/monitor_layer.html#user-content-layer-details).
+
+If every line is hidden, nothing is drawn.
 
 ## Using the Monitor Layer with RenderDoc
 

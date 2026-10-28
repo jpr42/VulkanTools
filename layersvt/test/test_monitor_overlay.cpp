@@ -30,6 +30,7 @@
 #include <vector>
 
 #include "monitor_overlay.h"
+#include "monitor_settings.h"
 
 using namespace std::chrono_literals;
 using Clock = std::chrono::steady_clock;
@@ -634,4 +635,50 @@ TEST(MonitorOverlay, TextUsesOnlyDrawableCharacters) {
                 << "'" << character << "' in " << line;
         }
     }
+}
+
+// Settings as an application would pass them with VK_EXT_layer_settings
+static monitor::RawSettings ReadSettings(const std::vector<VkLayerSettingEXT>& layer_settings) {
+    VkLayerSettingsCreateInfoEXT settings_info = {VK_STRUCTURE_TYPE_LAYER_SETTINGS_CREATE_INFO_EXT};
+    settings_info.settingCount = static_cast<uint32_t>(layer_settings.size());
+    settings_info.pSettings = layer_settings.data();
+    VkuLayerSettingSet settings = VK_NULL_HANDLE;
+    vkuCreateLayerSettingSet("VK_LAYER_LUNARG_monitor", &settings_info, nullptr, nullptr, &settings);
+    const monitor::RawSettings raw = monitor::ReadRawSettings(settings);
+    vkuDestroyLayerSettingSet(settings, nullptr);
+    return raw;
+}
+
+TEST(MonitorOverlay, SettingsDefaultWithoutASettingSet) {
+    // What the layer gets if the layer settings library couldn't create a setting set
+    const monitor::RawSettings raw = monitor::ReadRawSettings(VK_NULL_HANDLE);
+    const monitor::RawSettings defaults;
+    EXPECT_EQ(raw.position, defaults.position);
+    EXPECT_EQ(raw.scale, defaults.scale);
+    EXPECT_EQ(raw.update_interval_ms, defaults.update_interval_ms);
+    EXPECT_EQ(raw.show_fps, defaults.show_fps);
+    EXPECT_EQ(raw.show_frame_time, defaults.show_frame_time);
+    EXPECT_EQ(raw.show_frame_number, defaults.show_frame_number);
+}
+
+TEST(MonitorOverlay, SettingsAreReadFromTheApplication) {
+    const char* position = "BOTTOM_RIGHT";
+    const int32_t scale = 200;
+    const int32_t interval = 1000;
+    const VkBool32 off = VK_FALSE;
+    const std::vector<VkLayerSettingEXT> layer_settings = {
+        {"VK_LAYER_LUNARG_monitor", "position", VK_LAYER_SETTING_TYPE_STRING_EXT, 1, static_cast<const void*>(&position)},
+        {"VK_LAYER_LUNARG_monitor", "scale", VK_LAYER_SETTING_TYPE_INT32_EXT, 1, &scale},
+        {"VK_LAYER_LUNARG_monitor", "update_interval_ms", VK_LAYER_SETTING_TYPE_INT32_EXT, 1, &interval},
+        {"VK_LAYER_LUNARG_monitor", "show_fps", VK_LAYER_SETTING_TYPE_BOOL32_EXT, 1, &off},
+        {"VK_LAYER_LUNARG_monitor", "show_frame_time", VK_LAYER_SETTING_TYPE_BOOL32_EXT, 1, &off},
+        {"VK_LAYER_LUNARG_monitor", "show_frame_number", VK_LAYER_SETTING_TYPE_BOOL32_EXT, 1, &off},
+    };
+    const monitor::RawSettings raw = ReadSettings(layer_settings);
+    EXPECT_EQ(raw.position, "BOTTOM_RIGHT");
+    EXPECT_EQ(raw.scale, 200);
+    EXPECT_EQ(raw.update_interval_ms, 1000);
+    EXPECT_FALSE(raw.show_fps);
+    EXPECT_FALSE(raw.show_frame_time);
+    EXPECT_FALSE(raw.show_frame_number);
 }

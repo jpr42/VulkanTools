@@ -89,10 +89,12 @@ if (TARGET VkLayer_monitor)
                    test_monitor_overlay.cpp
                    ../monitor_overlay.cpp
                    ../monitor_overlay.h
+                   ../monitor_settings.cpp
+                   ../monitor_settings.h
                    layer_test_main.cpp)
     target_include_directories(test_monitor_overlay PRIVATE ..)
     target_compile_definitions(test_monitor_overlay PRIVATE MONITOR_SHADER_DIR="${CMAKE_CURRENT_SOURCE_DIR}/../shaders")
-    target_link_libraries(test_monitor_overlay Vulkan::Headers GTest::gtest)
+    target_link_libraries(test_monitor_overlay Vulkan::Headers Vulkan::LayerSettings GTest::gtest)
     add_test(NAME test_monitor_overlay COMMAND test_monitor_overlay)
     set_target_properties(test_monitor_overlay PROPERTIES FOLDER "layers/monitor/Test")
 

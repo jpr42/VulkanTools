@@ -102,6 +102,8 @@ if(BUILD_MONITOR)
         monitor_present.h
         monitor_renderer.cpp
         monitor_renderer.h
+        monitor_settings.cpp
+        monitor_settings.h
         shaders/monitor_overlay.vert
         shaders/monitor_overlay.frag
         vk_layer_table.cpp

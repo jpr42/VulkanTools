@@ -41,6 +41,8 @@
 
 #include "monitor_overlay.h"
 #include "monitor_present.h"
+#include "monitor_renderer.h"
+#include "monitor_settings.h"
 
 #ifdef __ANDROID__
 #include <android/log.h>
@@ -212,6 +214,12 @@ VKAPI_ATTR VkResult VKAPI_CALL vkCreateInstance(const VkInstanceCreateInfo *pCre
     my_data->instance = *pInstance;
     my_data->instance_dispatch_table = new VkuInstanceDispatchTable;
     vkuInitInstanceDispatchTable(*pInstance, my_data->instance_dispatch_table, fpGetInstanceProcAddr);
+
+    VkuLayerSettingSet layer_settings = VK_NULL_HANDLE;
+    vkuCreateLayerSettingSet("VK_LAYER_LUNARG_monitor", vkuFindLayerSettingsCreateInfo(pCreateInfo), pAllocator, nullptr,
+                             &layer_settings);
+    my_data->settings = monitor::ParseSettings(monitor::ReadRawSettings(layer_settings));
+    vkuDestroyLayerSettingSet(layer_settings, pAllocator);
 
     return result;
 }
